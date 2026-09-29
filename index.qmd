@@ -1,0 +1,18 @@
+---
+title: "통계분석 실습 노트"
+subtitle: "공개 데이터와 R 코드로 풀어 보는 통계분석 기법과 분석 프레임"
+listing:
+  contents: "posts/*/index.qmd"
+  sort: "date desc"
+  type: default
+  categories: true
+  sort-ui: false
+  filter-ui: false
+  date-format: "YYYY-MM-DD"
+  fields: [date, title, description, categories]
+page-layout: full
+title-block-banner: false
+toc: false
+---
+
+각 글에는 **개념 설명 → 단계별 실습 → 해석과 주의점** 순서의 가이드와 함께, 그대로 실행할 수 있는 **R 코드와 예시 데이터**가 들어 있습니다. 모든 예시는 공개된 외부 데이터만 사용합니다.

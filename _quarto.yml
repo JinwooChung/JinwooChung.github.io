@@ -1,0 +1,50 @@
+project:
+  type: website
+  output-dir: docs
+  resources:
+    - "posts/*/files/*"
+    - ".nojekyll"
+
+lang: ko
+
+website:
+  title: "통계분석 실습 노트"
+  description: "통계분석 기법과 분석 프레임을 공개 데이터와 R 코드로 풀어 보는 실습 노트"
+  site-url: "https://jinwoochung.github.io"
+  repo-url: "https://github.com/JinwooChung/JinwooChung.github.io"
+  search: true
+  page-navigation: true
+  navbar:
+    left:
+      - href: index.qmd
+        text: 글 목록
+      - href: about.qmd
+        text: 소개
+    right:
+      - icon: github
+        href: "https://github.com/JinwooChung/JinwooChung.github.io"
+        aria-label: GitHub
+  page-footer:
+    center: "© 2026 정진우 · 공개 데이터로 만든 실습 자료입니다. 자유롭게 참고하되 출처를 밝혀 주세요."
+
+format:
+  html:
+    theme:
+      light: cosmo
+      dark: darkly
+    css: styles.css
+    toc: true
+    toc-depth: 3
+    toc-title: "목차"
+    number-sections: false
+    code-copy: true
+    code-overflow: wrap
+    highlight-style: github
+    fig-align: center
+    lightbox: true
+    anchor-sections: true
+    smooth-scroll: true
+    mainfont: "Pretendard, 'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif"
+    include-in-header:
+      text: |
+        <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css">

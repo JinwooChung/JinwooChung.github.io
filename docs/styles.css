@@ -1,0 +1,6 @@
+body { word-break: keep-all; line-height: 1.75; }
+main img { border-radius: 6px; }
+.btn-dl { display:inline-block; font-size:.9rem; padding:.2rem .7rem; border:1px solid var(--bs-border-color); border-radius:6px; text-decoration:none; }
+.btn-dl::before { content: "⬇ "; }
+table { font-size: .95rem; }
+pre { font-size: .85rem; }

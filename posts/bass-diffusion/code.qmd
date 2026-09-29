@@ -1,0 +1,1140 @@
+---
+title: "코드와 데이터"
+subtitle: "[Bass 확산 모형 입문 가이드: 템플스테이 수요 예측 사례](index.qmd)"
+date: 2026-09-28
+---
+
+이 페이지의 스크립트는 모두 R로 작성했습니다. 폴더째 받으려면 **[전체 내려받기 (zip)](files/bass-diffusion.zip)** 를 누르세요.
+코드 블록 오른쪽 위의 복사 버튼으로 바로 복사할 수도 있습니다.
+
+## 예시 데이터
+
+- [`templestay_2002to2025.csv`](files/templestay_2002to2025.csv)
+
+## R 스크립트
+
+### `bass_functions.R`
+
+[파일 내려받기](files/bass_functions.R){.btn-dl}
+
+```{.r filename="bass_functions.R" .code-overflow-wrap}
+# =============================================================================
+# bass_functions.R — Bass 확산 모형 공용 함수 (2단계 이후 모든 스크립트에서 source)
+#
+#   모형:  누적 채택 비율  F(t) = (1 - e^{-(p+q)t}) / (1 + (q/p) e^{-(p+q)t})
+#          누적 채택자     N(t) = m F(t)
+#          연간 신규       n(t) = N(t) - N(t-1)      (연 단위 집계 자료용)
+#   위험함수: f(t) / (1 - F(t)) = p + q F(t)
+#
+#   추정 방법 (입력 d 는 t, n, N 열을 가진 data.frame)
+#     fit_ols     : Bass(1969) 이산형 OLS  n_t = a + b N_{t-1} + c N_{t-1}^2
+#     fit_nls_cum : 누적 NLS               N_t = m F(t)
+#     fit_nls_inc : 증분 NLS (Srinivasan & Mason 1986)  n_t = m [F(t) - F(t-1)]
+#   각 함수는 list(method, p, q, m, se, fit) 를 돌려준다. (se: 표준오차, OLS 는 NA)
+# =============================================================================
+
+bass_F <- function(t, p, q) (1 - exp(-(p + q) * t)) / (1 + (q / p) * exp(-(p + q) * t))
+bass_N <- function(t, p, q, m) m * bass_F(t, p, q)
+bass_n <- function(t, p, q, m) bass_N(t, p, q, m) - bass_N(t - 1, p, q, m)
+
+# 정점: 연속형 근사 t* = ln(q/p)/(p+q),  n* = m (p+q)^2 / 4q,  정점에서의 누적 비율 F* = (q-p)/2q
+bass_peak <- function(p, q, m) {
+  if (q <= p) return(c(t_star = 0, n_star = m * p, F_star = 0))  # q<=p 이면 처음부터 감소
+  c(t_star = log(q / p) / (p + q), n_star = m * (p + q)^2 / (4 * q), F_star = (q - p) / (2 * q))
+}
+
+na_result <- function(method) list(method = method, p = NA, q = NA, m = NA,
+                                   se = c(p = NA, q = NA, m = NA), fit = NULL)
+
+# ---- (A) OLS ---------------------------------------------------------------
+# n_t = p m + (q - p) N_{t-1} - (q/m) N_{t-1}^2  → 계수 (a, b, c) 로부터
+#   m = [-b - sqrt(b^2 - 4ac)] / 2c,  p = a/m,  q = -c m
+fit_ols <- function(d, N0 = 0) {
+  d$N_lag <- c(N0, head(d$N, -1))
+  fit <- lm(n ~ N_lag + I(N_lag^2), data = d)
+  cf <- coef(fit); a <- cf[1]; b <- cf[2]; c <- cf[3]
+  disc <- b^2 - 4 * a * c
+  if (is.na(c) || c >= 0 || disc < 0) {
+    r <- na_result("OLS"); r$fit <- fit; r$note <- "c>=0 또는 판별식<0: m 역산 불가"; return(r)
+  }
+  m <- unname((-b - sqrt(disc)) / (2 * c))
+  list(method = "OLS", p = unname(a / m), q = unname(-c * m), m = m,
+       se = c(p = NA, q = NA, m = NA), fit = fit)
+}
+
+# ---- NLS 공통: 다중 시작점, 경계 제약(port), RSS 최소 해 채택 ---------------
+nls_multistart <- function(formula, d, method, N0 = 0) {
+  starts <- list()
+  o <- fit_ols(d, N0)
+  if (!is.na(o$m) && o$p > 0 && o$q > 0 && o$m > max(d$N))
+    starts[[1]] <- list(p = o$p, q = o$q, m = o$m)
+  for (pq in list(c(.03, .38), c(.01, .15), c(.005, .5), c(.001, .3)))
+    for (k in c(1.5, 3, 6))
+      starts[[length(starts) + 1]] <- list(p = pq[1], q = pq[2], m = k * max(d$N))
+  best <- NULL
+  for (st in starts) {
+    f <- tryCatch(nls(formula, data = d, start = st, algorithm = "port",
+                      lower = c(p = 1e-6, q = 1e-5, m = max(d$N)),
+                      upper = c(p = 1, q = 3, m = 1000 * max(d$N)),
+                      control = nls.control(maxiter = 1000)),
+                  error = function(e) NULL)
+    if (!is.null(f) && (is.null(best) || deviance(f) < deviance(best))) best <- f
+  }
+  if (is.null(best)) return(na_result(method))
+  cf <- coef(best)
+  se <- tryCatch(summary(best)$coefficients[c("p", "q", "m"), "Std. Error"],
+                 error = function(e) c(p = NA, q = NA, m = NA))
+  list(method = method, p = unname(cf["p"]), q = unname(cf["q"]), m = unname(cf["m"]),
+       se = se, fit = best)
+}
+
+# ---- (B) 누적 NLS ----------------------------------------------------------
+fit_nls_cum <- function(d, N0 = 0)
+  nls_multistart(N ~ m * bass_F(t, p, q), d, "NLS_cum", N0)
+
+# ---- (C) 증분 NLS ----------------------------------------------------------
+fit_nls_inc <- function(d, N0 = 0)
+  nls_multistart(n ~ m * (bass_F(t, p, q) - bass_F(t - 1, p, q)), d, "NLS_inc", N0)
+
+BASS_METHODS <- list(OLS = fit_ols, NLS_cum = fit_nls_cum, NLS_inc = fit_nls_inc)
+
+# ---- 결과 요약 한 줄 -------------------------------------------------------
+#  t0: t=1 에 해당하는 연도 - 1 (예: 2002년이 t=1 이면 t0 = 2001)
+summarise_fit <- function(r, d, t0) {
+  if (is.na(r$m)) return(data.frame(method = r$method, p = NA, q = NA, m = NA,
+                                    se_p = NA, se_q = NA, se_m = NA, q_over_p = NA,
+                                    peak_year = NA, peak_n = NA, F_last = NA,
+                                    rmse_n = NA, r2_n = NA))
+  pk <- bass_peak(r$p, r$q, r$m)
+  n_hat <- bass_n(d$t, r$p, r$q, r$m)
+  data.frame(method = r$method, p = r$p, q = r$q, m = r$m,
+             se_p = r$se["p"], se_q = r$se["q"], se_m = r$se["m"],
+             q_over_p = r$q / r$p,
+             peak_year = t0 + pk["t_star"], peak_n = pk["n_star"],
+             F_last = tail(d$N, 1) / r$m,                     # 마지막 관측 연도까지 도달한 비율
+             rmse_n = sqrt(mean((d$n - n_hat)^2)),             # 연간값 기준 적합 오차
+             r2_n = 1 - sum((d$n - n_hat)^2) / sum((d$n - mean(d$n))^2),
+             row.names = NULL)
+}
+
+# ---- 한글 글꼴·PNG 헬퍼 ----------------------------------------------------
+if (.Platform$OS.type == "windows") {
+  windowsFonts(KR = windowsFont("Malgun Gothic")); FONT <- "KR"
+} else FONT <- "NanumGothic"
+open_png <- function(file, w, h, dir = "out") {
+  dir.create(dir, showWarnings = FALSE)
+  png(file.path(dir, file), width = w, height = h, res = 150)
+  par(family = FONT)
+}
+METHOD_COL <- c(OLS = "#8a8a8a", NLS_cum = "#2f6db5", NLS_inc = "#d9822b")
+
+# ---- 자료 읽기 (순인원, 만 명 단위) ----------------------------------------
+load_templestay <- function(file = "templestay_2002to2025.csv", start_year = 2002) {
+  raw <- read.csv(file, fileEncoding = "UTF-8-BOM")
+  d <- raw[raw$year >= start_year, ]
+  d$t <- d$year - (start_year - 1)
+  d$n <- d$uniq_total / 1e4
+  d$N <- cumsum(d$n)
+  d
+}
+```
+
+### `01_data_explore.R`
+
+[파일 내려받기](files/01_data_explore.R){.btn-dl}
+
+```{.r filename="01_data_explore.R" .code-overflow-wrap}
+# =============================================================================
+# 01_data_explore.R
+# Bass 확산 모형 학습 — 1단계: 데이터 탐색
+#
+# 목적: 모형을 돌리기 전에 자료의 "모양"을 먼저 본다.
+#   - 연간 순인원이 S자 확산의 종 모양(증가→정점→감소)을 보이는가?
+#   - 누적 순인원이 S자 곡선의 어디쯤에 와 있는가? (정점을 지났는가?)
+#   - 이상 연도(2002 월드컵 특수, 2020~21 코로나)는 어디인가?
+#   - 공급(사찰 수) 확대가 참가자 증가와 얼마나 겹치는가?
+#   - Bass 위상도(n_t vs N_{t-1}): 2단계 OLS 추정이 실제로 하는 일을 미리 본다.
+#
+# 입력: templestay_2002to2025.csv  (순인원 2002~2025, 연인원 2002~2021, 사찰 수)
+# 출력: out/01_*.png, out/01_summary.csv
+# 필요 패키지: 없음 (base R)
+# 실행: 작업 폴더를 BassModel 로 두고 source("01_data_explore.R")
+# =============================================================================
+
+out_dir <- "out"
+dir.create(out_dir, showWarnings = FALSE)
+
+# 한글 글꼴: Windows 는 맑은 고딕, 그 외(Linux/Mac)는 나눔고딕
+if (.Platform$OS.type == "windows") {
+  windowsFonts(KR = windowsFont("Malgun Gothic")); FONT <- "KR"
+} else FONT <- "NanumGothic"
+open_png <- function(file, w, h) {
+  png(file.path(out_dir, file), width = w, height = h, res = 150)
+  par(family = FONT)
+}
+
+# -----------------------------------------------------------------------------
+# 1. 자료 읽기와 파생 변수
+# -----------------------------------------------------------------------------
+d <- read.csv("templestay_2002to2025.csv", fileEncoding = "UTF-8-BOM")
+
+d$t        <- d$year - 2001                        # 도입 후 연차 (2002 = 1)
+d$n        <- d$uniq_total / 1e4                   # 연간 순인원 (만 명) — Bass 의 n(t)
+d$N        <- cumsum(d$n)                          # 누적 순인원 (만 명) — Bass 의 N(t)
+d$N_lag    <- c(0, head(d$N, -1))                  # 전년도 말 누적 N(t-1)
+d$growth   <- c(NA, diff(d$n) / head(d$n, -1))     # 전년 대비 증감률
+d$per_temple <- d$uniq_total / d$temples           # 사찰당 순인원 (명)
+d$for_share  <- d$uniq_for / d$uniq_total          # 외국인 비중
+d$pday_ratio <- d$pday_total / d$uniq_total        # 연인원 / 순인원 (평균 체류 일수의 대리 지표)
+
+covid <- d$year %in% 2020:2021
+wc02  <- d$year == 2002
+
+# 콘솔 요약표
+show <- data.frame(
+  연도 = d$year, 사찰 = d$temples,
+  `순인원(만)` = round(d$n, 1), `누적(만)` = round(d$N, 1),
+  증감률 = ifelse(is.na(d$growth), "", sprintf("%+.1f%%", 100 * d$growth)),
+  사찰당 = round(d$per_temple), 외국인비중 = sprintf("%.0f%%", 100 * d$for_share),
+  `연/순` = ifelse(is.na(d$pday_ratio), "", sprintf("%.2f", d$pday_ratio)),
+  check.names = FALSE)
+cat("\n[1] 연도별 요약\n"); print(show, row.names = FALSE)
+write.csv(d, file.path(out_dir, "01_summary.csv"), row.names = FALSE, fileEncoding = "UTF-8")
+
+# 몇 가지 핵심 수치
+i_max <- which.max(d$n)
+cat(sprintf("\n[2] 연간 순인원 최대: %d년 %.1f만 명 (마지막 관측 연도 = %d)\n",
+            d$year[i_max], d$n[i_max], max(d$year)))
+cat(sprintf("    누적 순인원 2025년 말: %.1f만 명\n", tail(d$N, 1)))
+pre <- d$year %in% 2003:2019
+cat(sprintf("    2003→2019 연평균 증가율: 순인원 %.1f%%, 사찰 수 %.1f%%\n",
+            100 * ((d$n[d$year == 2019] / d$n[d$year == 2003])^(1/16) - 1),
+            100 * ((d$temples[d$year == 2019] / d$temples[d$year == 2003])^(1/16) - 1)))
+cat(sprintf("    연도별 순인원과 사찰 수의 상관 (2003~2019): r = %.2f\n",
+            cor(d$n[pre], d$temples[pre])))
+
+# -----------------------------------------------------------------------------
+# 2. 그림 1 — 네 가지 기본 모양 (2x2)
+# -----------------------------------------------------------------------------
+C_DOM <- "#2f6db5"; C_FOR <- "#d9822b"; C_GREY <- "grey45"
+shade_covid <- function() {
+  u <- par("usr"); rect(2019.5, u[3], 2021.5, u[4], col = adjustcolor("red", .08), border = NA)
+}
+
+open_png("01_fig1_overview.png", 1800, 1300)
+par(mfrow = c(2, 2), mar = c(4, 4.5, 3, 4))
+
+# (a) 연간 순인원: 내국인 + 외국인 누적 막대
+m <- rbind(d$uniq_dom, d$uniq_for) / 1e4
+bp <- barplot(m, names.arg = d$year, col = c(C_DOM, C_FOR), border = NA, las = 2,
+              cex.names = .7, ylab = "만 명", main = "(a) 연간 순인원 n(t)")
+legend("topleft", c("내국인", "외국인"), fill = c(C_DOM, C_FOR), bty = "n", border = NA)
+u <- par("usr"); rect(bp[19] - .6, u[3], bp[20] + .6, u[4], col = adjustcolor("red", .08), border = NA)
+text(mean(bp[19:20]), max(colSums(m)) * .97, "코로나", cex = .8, col = "red")
+
+# (b) 누적 순인원
+plot(d$year, d$N, type = "b", pch = 16, col = C_DOM, xlab = "", ylab = "만 명",
+     main = "(b) 누적 순인원 N(t)")
+shade_covid(); grid(col = "grey90")
+
+# (c) 공급: 사찰 수와 사찰당 참가자
+plot(d$year, d$temples, type = "b", pch = 16, col = C_GREY, xlab = "", ylab = "사찰 수",
+     main = "(c) 공급: 사찰 수(회색) · 사찰당 순인원(주황)")
+shade_covid()
+par(new = TRUE)
+plot(d$year, d$per_temple, type = "b", pch = 17, col = C_FOR, axes = FALSE, xlab = "", ylab = "")
+axis(4, col.axis = C_FOR); mtext("사찰당 순인원(명)", side = 4, line = 2.5, col = C_FOR, cex = .8)
+
+# (d) 외국인 비중과 연/순 비율
+plot(d$year, 100 * d$for_share, type = "b", pch = 16, col = C_FOR, xlab = "", ylab = "외국인 비중(%)",
+     main = "(d) 외국인 비중(주황) · 연인원/순인원(회색)")
+shade_covid()
+par(new = TRUE)
+plot(d$year, d$pday_ratio, type = "b", pch = 17, col = C_GREY, axes = FALSE, xlab = "", ylab = "",
+     xlim = range(d$year))
+axis(4, col.axis = C_GREY); mtext("연인원/순인원", side = 4, line = 2.5, col = C_GREY, cex = .8)
+dev.off()
+
+# -----------------------------------------------------------------------------
+# 3. 그림 2 — Bass 위상도: n(t) 대 N(t-1)
+#    Bass 이산형: n_t = p*m + (q-p)*N_{t-1} - (q/m)*N_{t-1}^2
+#    → 모형이 맞다면 점들이 "뒤집힌 U자(포물선)" 위에 놓인다.
+#      - 포물선의 꼭짓점 = 정점, 오른쪽 끝이 가로축과 만나는 곳 = m
+#      - 점들이 아직 오르막에만 있으면 꼭짓점·m 을 자료가 직접 보여주지 못한다.
+# -----------------------------------------------------------------------------
+open_png("01_fig2_phase.png", 1300, 1000)
+par(mar = c(4.5, 4.5, 3, 1))
+col_pt <- ifelse(covid, "red", ifelse(wc02, C_FOR, C_DOM))
+plot(d$N_lag, d$n, pch = 16, col = col_pt, cex = 1.2,
+     xlim = c(0, max(d$N_lag) * 1.05), ylim = c(0, max(d$n) * 1.1),
+     xlab = "전년도 말 누적 순인원 N(t-1) (만 명)", ylab = "당해 연도 순인원 n(t) (만 명)",
+     main = "Bass 위상도: n(t) vs N(t-1)")
+lines(d$N_lag, d$n, col = "grey80")
+text(d$N_lag, d$n, sprintf("%02d", d$year %% 100), cex = .65, col = col_pt,
+     pos = ifelse(d$year == 2003, 2, 3))   # 2003·2004 라벨 겹침 방지
+# 참고용: 코로나 2년을 뺀 점들에 2차식을 그대로 맞춘 곡선 (= 2단계 OLS 의 예고편)
+ok <- !covid
+fit_q <- lm(n ~ N_lag + I(N_lag^2), data = d[ok, ])
+xx <- seq(0, max(d$N_lag) * 1.05, length.out = 200)
+lines(xx, predict(fit_q, data.frame(N_lag = xx)), lty = 2, col = C_GREY)
+legend("topleft", bty = "n", cex = .8,
+       legend = c("일반 연도", "2002 (월드컵 특수)", "2020-21 (코로나)", "2차식 적합(코로나 제외, 참고)"),
+       col = c(C_DOM, C_FOR, "red", C_GREY), pch = c(16, 16, 16, NA), lty = c(NA, NA, NA, 2))
+dev.off()
+cat("\n[3] 위상도 2차식(코로나 제외) 계수: ",
+    paste(names(coef(fit_q)), signif(coef(fit_q), 3), sep = "=", collapse = ", "), "\n")
+
+cat(sprintf("\n그래프와 요약표를 '%s' 폴더에 저장했습니다.\n", out_dir))
+```
+
+### `02_bass_fit.R`
+
+[파일 내려받기](files/02_bass_fit.R){.btn-dl}
+
+```{.r filename="02_bass_fit.R" .code-overflow-wrap}
+# =============================================================================
+# 02_bass_fit.R
+# Bass 확산 모형 학습 — 2단계: 기본 추정 (세 가지 추정법 비교)
+#
+# 설정 (의도적으로 "손대지 않은" 기본형 — 3단계에서 하나씩 바꿔 본다)
+#   - 자료: 순인원 합계 2002~2025 (24개 연도), 단위 만 명
+#   - 출발점: 2002년 = t=1
+#   - 코로나 2020~21: 그대로 포함
+#
+# 보는 것
+#   (1) 추정법(OLS / 누적 NLS / 증분 NLS)에 따라 p, q, m 이 얼마나 다른가
+#   (2) 표준오차: 각 모수가 얼마나 "확실하게" 정해졌는가
+#   (3) 모형이 말하는 정점 시점·규모, 2025년까지 m 의 몇 %에 도달했는가
+#   (4) 적합 곡선과 잔차: 어디서 체계적으로 어긋나는가
+#
+# 필요 파일: bass_functions.R, templestay_2002to2025.csv
+# 출력: out/02_*.png, out/02_estimates.csv
+# =============================================================================
+
+source("bass_functions.R")
+
+d  <- load_templestay(start_year = 2002)
+T0 <- 2001                                   # t=1 ↔ 2002년
+
+# -----------------------------------------------------------------------------
+# 1. 세 가지 방법으로 추정
+# -----------------------------------------------------------------------------
+fits <- lapply(BASS_METHODS, function(f) f(d))
+est  <- do.call(rbind, lapply(fits, summarise_fit, d = d, t0 = T0))
+
+cat("\n[1] 추정 결과 (순인원 2002~2025, 코로나 포함, 단위: 만 명)\n")
+show <- with(est, data.frame(
+  방법 = method,
+  p = sprintf("%.4f", p), `se(p)` = ifelse(is.na(se_p), "-", sprintf("%.4f", se_p)),
+  q = sprintf("%.3f", q), `se(q)` = ifelse(is.na(se_q), "-", sprintf("%.3f", se_q)),
+  m = sprintf("%.0f", m), `se(m)` = ifelse(is.na(se_m), "-", sprintf("%.0f", se_m)),
+  `q/p` = sprintf("%.1f", q_over_p),
+  정점연도 = sprintf("%.1f", peak_year), `정점 연간(만)` = sprintf("%.1f", peak_n),
+  `2025 도달률` = sprintf("%.0f%%", 100 * F_last),
+  RMSE = sprintf("%.2f", rmse_n), R2 = sprintf("%.2f", r2_n), check.names = FALSE))
+print(show, row.names = FALSE)
+write.csv(est, file.path("out", "02_estimates.csv"), row.names = FALSE)
+
+# OLS 회귀계수도 따로 보기 (m, p, q 로 역산되기 전의 원래 모습)
+cat("\n[2] OLS 회귀계수 (n_t = a + b N_{t-1} + c N_{t-1}^2)\n")
+print(round(summary(fits$OLS$fit)$coefficients, 5))
+
+# -----------------------------------------------------------------------------
+# 2. 그림 1 — 적합 곡선: 연간(좌) · 누적(우), 2060년까지 연장
+# -----------------------------------------------------------------------------
+yrs_f <- 2002:2060; tt <- yrs_f - T0
+covid <- d$year %in% 2020:2021
+
+open_png("02_fig1_fit.png", 1900, 800)
+par(mfrow = c(1, 2), mar = c(4, 4.5, 3, 1))
+
+ymax <- max(d$n, sapply(fits, function(r) if (is.na(r$m)) 0 else max(bass_n(tt, r$p, r$q, r$m))))
+plot(d$year, d$n, pch = 16, col = ifelse(covid, "red", "black"), xlim = range(yrs_f),
+     ylim = c(0, ymax * 1.05), xlab = "", ylab = "만 명", main = "연간 순인원: 실제 vs Bass 적합")
+for (k in names(fits)) { r <- fits[[k]]; if (!is.na(r$m))
+  lines(yrs_f, bass_n(tt, r$p, r$q, r$m), col = METHOD_COL[k], lwd = 2) }
+abline(v = 2025.5, lty = 3)
+legend("topright", bty = "n", cex = .8, legend = c("실제", "실제(코로나)", names(fits)),
+       col = c("black", "red", METHOD_COL), pch = c(16, 16, NA, NA, NA), lty = c(NA, NA, 1, 1, 1), lwd = 2)
+
+mmax <- max(d$N, est$m, na.rm = TRUE)
+plot(d$year, d$N, pch = 16, xlim = range(yrs_f), ylim = c(0, mmax * 1.05),
+     xlab = "", ylab = "만 명", main = "누적 순인원: 실제 vs Bass 적합 (점선 = 추정 m)")
+for (k in names(fits)) { r <- fits[[k]]; if (!is.na(r$m)) {
+  lines(yrs_f, bass_N(tt, r$p, r$q, r$m), col = METHOD_COL[k], lwd = 2)
+  abline(h = r$m, col = METHOD_COL[k], lty = 2) } }
+abline(v = 2025.5, lty = 3)
+dev.off()
+
+# -----------------------------------------------------------------------------
+# 3. 그림 2 — 연간값 잔차 (실제 - 적합): 체계적인 패턴이 있는가
+# -----------------------------------------------------------------------------
+open_png("02_fig2_residuals.png", 1500, 700)
+par(mar = c(4, 4.5, 3, 1))
+res <- sapply(fits, function(r) if (is.na(r$m)) rep(NA, nrow(d)) else d$n - bass_n(d$t, r$p, r$q, r$m))
+matplot(d$year, res, type = "b", pch = 16, lty = 1, col = METHOD_COL[colnames(res)],
+        xlab = "", ylab = "실제 - 적합 (만 명)", main = "연간 순인원 잔차")
+abline(h = 0, col = "grey50")
+u <- par("usr"); rect(2019.5, u[3], 2021.5, u[4], col = adjustcolor("red", .08), border = NA)
+legend("bottomleft", bty = "n", cex = .8, legend = colnames(res), col = METHOD_COL[colnames(res)], lty = 1, pch = 16)
+dev.off()
+
+cat("\n그래프와 추정표를 'out' 폴더에 저장했습니다.\n")
+```
+
+### `03_specification.R`
+
+[파일 내려받기](files/03_specification.R){.btn-dl}
+
+```{.r filename="03_specification.R" .code-overflow-wrap}
+# =============================================================================
+# 03_specification.R
+# Bass 확산 모형 학습 — 3단계: 분석 설정(specification) 비교
+#
+# 질문: "분석자가 내리는 선택"이 p, q, m 과 정점 판단을 얼마나 바꾸는가?
+#
+#   결정 1. 출발점:  2002년 = t1  vs  2003년 = t1  (2002는 월드컵 특수로 운영된 해)
+#   결정 2. 코로나 2020~21 처리
+#       (a) 포함   : 아무것도 하지 않음 (2단계와 같음)
+#       (b) 제외   : 두 해를 추정에서 뺌. 단, 누적값 N 에는 그 해 참가자가 그대로 들어 있음
+#       (c) 더미   : 코로나 연도 효과를 모수로 따로 추정
+#            - OLS    : n_t = a + b N_{t-1} + c N_{t-1}^2 + δ·covid     (δ = 줄어든 인원, 만 명)
+#            - 증분NLS: n_t = m[F(t)-F(t-1)] × (1 - δ·covid)            (δ = 줄어든 비율)
+#            - 누적NLS: 누적식에는 더미를 자연스럽게 넣기 어려워 생략
+#
+#   → 2 × 3 × 3방법 = 최대 18개 추정
+#
+# 필요 파일: bass_functions.R, templestay_2002to2025.csv
+# 출력: out/03_*.png, out/03_specs.csv
+# =============================================================================
+
+source("bass_functions.R")
+
+run_spec <- function(start_year, covid_mode) {
+  d  <- load_templestay(start_year = start_year)
+  t0 <- start_year - 1
+  d$covid <- as.integer(d$year %in% 2020:2021)
+  d$N_lag <- c(0, head(d$N, -1))              # 실제 전년 누적 (행을 빼도 유지되도록 미리 계산)
+
+  d_est <- if (covid_mode == "exclude") d[d$covid == 0, ] else d
+
+  fits <- switch(covid_mode,
+    include = list(OLS = fit_ols(d_est), NLS_cum = fit_nls_cum(d_est), NLS_inc = fit_nls_inc(d_est)),
+    exclude = list(OLS = fit_ols(d_est), NLS_cum = fit_nls_cum(d_est), NLS_inc = fit_nls_inc(d_est)),
+    dummy   = list(OLS = fit_ols(d_est, covid_dummy = TRUE),
+                   NLS_cum = na_result("NLS_cum"),
+                   NLS_inc = fit_nls_inc_dummy(d_est)))
+
+  out <- do.call(rbind, lapply(fits, function(r) {
+    s <- summarise_fit(r, d, t0)             # 적합도·도달률은 전체 자료 기준으로 계산
+    s$delta <- NA
+    if (covid_mode == "dummy" && !is.na(r$m)) {
+      s$delta <- if (r$method == "OLS") coef(r$fit)["covid"] else r$extra["delta"]
+    }
+    s
+  }))
+  cbind(start = start_year, covid = covid_mode, out)
+}
+
+specs <- expand.grid(start = c(2002, 2003), covid = c("include", "exclude", "dummy"),
+                     stringsAsFactors = FALSE)
+res <- do.call(rbind, Map(run_spec, specs$start, specs$covid))
+res <- res[!(res$covid == "dummy" & res$method == "NLS_cum"), ]
+rownames(res) <- NULL
+write.csv(res, file.path("out", "03_specs.csv"), row.names = FALSE)
+
+cat("\n[1] 설정별 추정 결과 (단위: 만 명; δ: OLS=줄어든 인원(만), NLS_inc=줄어든 비율)\n")
+show <- with(res, data.frame(
+  시작 = start, 코로나 = covid, 방법 = method,
+  p = sprintf("%.4f", p), q = sprintf("%.3f", q),
+  m = sprintf("%.0f", m), `se(m)` = ifelse(is.na(se_m), "-", sprintf("%.0f", se_m)),
+  정점 = sprintf("%.1f", peak_year), `2025도달` = sprintf("%.0f%%", 100 * F_last),
+  δ = ifelse(is.na(delta), "", sprintf("%.2f", delta)), R2 = sprintf("%.2f", r2_n),
+  check.names = FALSE))
+print(show, row.names = FALSE)
+
+cat("\n[2] 방법별 m 범위 (모든 설정을 통틀어)\n")
+print(aggregate(m ~ method, res, function(v) round(c(min = min(v), max = max(v)))))
+
+# -----------------------------------------------------------------------------
+# 그림 1 — 설정별 m 추정치 (점) ± 1.96 se (선), 방법별 색
+# -----------------------------------------------------------------------------
+res$label <- sprintf("%d·%s", res$start, c(include = "포함", exclude = "제외", dummy = "더미")[res$covid])
+labs <- unique(res$label)
+open_png("03_fig1_m_by_spec.png", 1500, 850)
+par(mfrow = c(1, 2), mar = c(5, 7, 3, 1))
+for (what in c("m", "peak_year")) {
+  xr <- if (what == "m") range(c(res$m - 1.96 * ifelse(is.na(res$se_m), 0, res$se_m),
+                                 res$m + 1.96 * ifelse(is.na(res$se_m), 0, res$se_m)), na.rm = TRUE)
+        else range(res$peak_year, 2025, na.rm = TRUE)
+  xr <- if (what == "m") c(max(0, xr[1]), min(xr[2], 3000)) else xr
+  plot(NA, xlim = xr, ylim = c(.5, length(labs) + .5), yaxt = "n", ylab = "",
+       xlab = if (what == "m") "m (만 명)" else "정점 연도",
+       main = if (what == "m") "잠재시장 m (± 1.96 se)" else "모형이 말하는 정점 연도")
+  axis(2, at = seq_along(labs), labels = labs, las = 1, cex.axis = .8)
+  off <- c(OLS = -.2, NLS_cum = 0, NLS_inc = .2)
+  for (i in seq_len(nrow(res))) {
+    y <- match(res$label[i], labs) + off[res$method[i]]
+    x <- res[[what]][i]; col <- METHOD_COL[res$method[i]]
+    if (what == "m" && !is.na(res$se_m[i]))
+      segments(max(0, x - 1.96 * res$se_m[i]), y, x + 1.96 * res$se_m[i], y, col = col, lwd = 2)
+    points(x, y, pch = 16, col = col, cex = 1.2)
+  }
+  if (what == "m") {                                   # 2025년 말 실제 누적 = m 의 하한
+    abline(v = max(res$m * res$F_last, na.rm = TRUE), lty = 3)
+    text(max(res$m * res$F_last, na.rm = TRUE), length(labs) + .45, "2025 누적", pos = 4, cex = .7)
+  }
+  if (what == "peak_year") abline(v = 2025, lty = 3)
+  legend("bottomright", bty = "n", cex = .75, legend = names(METHOD_COL), col = METHOD_COL, pch = 16)
+}
+dev.off()
+
+# -----------------------------------------------------------------------------
+# 그림 2 — 증분 NLS 의 연간 적합 곡선을 설정별로 겹쳐 보기
+# -----------------------------------------------------------------------------
+d_all <- load_templestay(start_year = 2002)
+yrs <- 2002:2060
+open_png("03_fig2_curves_nls_inc.png", 1400, 800)
+par(mar = c(4, 4.5, 3, 1))
+plot(d_all$year, d_all$n, pch = 16, col = ifelse(d_all$year %in% 2020:2021, "red", "black"),
+     xlim = range(yrs), ylim = c(0, 40), xlab = "", ylab = "만 명",
+     main = "증분 NLS 적합 곡선: 설정별 비교 (더미 모형은 코로나가 없었을 경우의 곡선)")
+sub <- res[res$method == "NLS_inc", ]
+lcol <- c("#1b9e77", "#d95f02", "#7570b3", "#e7298a", "#66a61e", "#e6ab02")
+for (i in seq_len(nrow(sub))) {
+  t0 <- sub$start[i] - 1
+  yy <- yrs[yrs >= sub$start[i]]
+  lines(yy, bass_n(yy - t0, sub$p[i], sub$q[i], sub$m[i]), col = lcol[i], lwd = 2)
+}
+abline(v = 2025.5, lty = 3)
+legend("topright", bty = "n", cex = .8,
+       legend = ifelse(sub$covid == "dummy", paste0(sub$label, " (제외와 사실상 겹침)"), sub$label),
+       col = lcol[seq_len(nrow(sub))], lwd = 2)
+dev.off()
+
+cat("\n그래프와 결과표를 'out' 폴더에 저장했습니다.\n")
+```
+
+### `04_forecast_validate.R`
+
+[파일 내려받기](files/04_forecast_validate.R){.btn-dl}
+
+```{.r filename="04_forecast_validate.R" .code-overflow-wrap}
+# =============================================================================
+# 04_forecast_validate.R
+# Bass 확산 모형 학습 — 4단계: 예측 검증(holdout)과 논문 모형 재현
+#
+# Part A. 표본 밖 예측 검증 (순인원)
+#   "표본 내 적합도(R2)가 좋다" ≠ "예측을 잘한다". 일부 연도를 숨겨 두고 맞히는지 본다.
+#     H1: 2002~2015 로 추정 → 2016~2019 예측   (코로나 없는 깨끗한 검증)
+#     H2: 2002~2019 로 추정 → 2022~2025 예측   (코로나 이후 회복기; 2020~21 은 오차 계산에서 제외)
+#   비교 기준(벤치마크): Bass 가 "아무 모형도 안 쓴 것"보다 나은가?
+#     Naive : 마지막 관측값이 그대로 유지된다고 예측
+#     Drift : 마지막 5년의 평균 증가분만큼 매년 늘어난다고 예측
+#   예측 방식
+#     OLS      : 마지막 실제 누적 N_T 에서 출발해 n = a + bN + cN^2 를 한 해씩 반복 적용
+#     NLS 2종  : 추정된 곡선 n(t) = m[F(t) - F(t-1)] 을 그대로 연장
+#
+# Part B. 논문 모형 재현 (연인원 2002~2023)
+#   자료: 연인원 2002~2021 (20년사) + 2022·2023 (논문 표1 누적값의 차분: 43.0, 54.6 만)
+#   목표: 논문의 m=907.5만, p=.01, q=.18 과 표1·표2 예측치를 재현 → 논문이 쓴 추정법을 역추적
+#
+# 필요 파일: bass_functions.R, templestay_2002to2025.csv
+# 출력: out/04_*.png, out/04_holdout.csv, out/04_paper_replication.csv
+# =============================================================================
+
+source("bass_functions.R")
+
+# OLS 예측: 출발 누적 N_start 에서 h 년 앞까지 이산형 Bass 식을 반복 적용
+ols_forecast <- function(fit, N_start, h) {
+  cf <- coef(fit)[1:3]; out <- numeric(h); N <- N_start
+  for (i in 1:h) { n <- cf[1] + cf[2] * N + cf[3] * N^2; out[i] <- n; N <- N + n }
+  out
+}
+mape <- function(actual, pred) mean(abs(pred - actual) / actual) * 100
+
+# =============================================================================
+# Part A. 표본 밖 예측 검증
+# =============================================================================
+d <- load_templestay(start_year = 2002)            # 순인원, t=1 ↔ 2002
+
+run_holdout <- function(train_end, test_years) {
+  tr <- d[d$year <= train_end, ]
+  fyears <- (train_end + 1):max(test_years)          # 예측 구간 (코로나 연도 포함해 연속으로)
+  h <- length(fyears); tf <- fyears - 2001
+  preds <- list()
+  f_ols <- fit_ols(tr)
+  preds$OLS     <- ols_forecast(f_ols$fit, tail(tr$N, 1), h)
+  f_cum <- fit_nls_cum(tr); preds$NLS_cum <- bass_n(tf, f_cum$p, f_cum$q, f_cum$m)
+  f_inc <- fit_nls_inc(tr); preds$NLS_inc <- bass_n(tf, f_inc$p, f_inc$q, f_inc$m)
+  last  <- tail(tr$n, 1)
+  preds$Naive <- rep(last, h)
+  preds$Drift <- last + (1:h) * mean(diff(tail(tr$n, 6)))
+  pars <- rbind(OLS = c(f_ols$p, f_ols$q, f_ols$m), NLS_cum = c(f_cum$p, f_cum$q, f_cum$m),
+                NLS_inc = c(f_inc$p, f_inc$q, f_inc$m))
+  colnames(pars) <- c("p", "q", "m")
+  idx <- fyears %in% test_years
+  act <- d$n[match(fyears[idx], d$year)]
+  tab <- data.frame(holdout = sprintf("~%d → %d-%d", train_end, min(test_years), max(test_years)),
+                    model = names(preds),
+                    MAPE = sapply(preds, function(p) mape(act, p[idx])),
+                    pred_last = sapply(preds, function(p) p[length(p)]),
+                    actual_last = tail(act, 1), row.names = NULL)
+  list(tab = tab, preds = preds, fyears = fyears, pars = pars, train_end = train_end, test = test_years)
+}
+
+H1 <- run_holdout(2015, 2016:2019)
+H2 <- run_holdout(2019, 2022:2025)
+hold <- rbind(H1$tab, H2$tab)
+write.csv(hold, file.path("out", "04_holdout.csv"), row.names = FALSE)
+
+cat("\n[A-1] 학습 구간별 추정 모수 (순인원, 만 명)\n")
+cat("  H1 (2002~2015)\n"); print(round(H1$pars, 4))
+cat("  H2 (2002~2019)\n"); print(round(H2$pars, 4))
+cat("\n[A-2] 예측 오차 (MAPE, 연간 순인원 기준; 작을수록 좋음)\n")
+print(transform(hold, MAPE = sprintf("%.1f%%", MAPE), pred_last = round(pred_last, 1),
+                actual_last = round(actual_last, 1)), row.names = FALSE)
+
+MODEL_COL <- c(METHOD_COL, Naive = "black", Drift = "#7b3294")
+MODEL_LTY <- c(OLS = 1, NLS_cum = 1, NLS_inc = 1, Naive = 3, Drift = 2)
+open_png("04_fig1_holdout.png", 1900, 800)
+par(mfrow = c(1, 2), mar = c(4, 4.5, 3, 1))
+for (H in list(H1, H2)) {
+  plot(d$year, d$n, type = "n", xlim = c(2002, 2025), ylim = c(0, 40), xlab = "", ylab = "만 명",
+       main = sprintf("%d년까지로 추정 → %d~%d 예측", H$train_end, min(H$test), max(H$test)))
+  u <- par("usr"); rect(min(H$test) - .5, u[3], max(H$test) + .5, u[4], col = "grey93", border = NA)
+  if (H$train_end == 2019) rect(2019.5, u[3], 2021.5, u[4], col = adjustcolor("red", .08), border = NA)
+  for (k in names(H$preds)) lines(H$fyears, H$preds[[k]], col = MODEL_COL[k], lty = MODEL_LTY[k], lwd = 2)
+  tr <- d$year <= H$train_end
+  points(d$year[tr], d$n[tr], pch = 16)
+  points(d$year[!tr], d$n[!tr], pch = 1, cex = 1.1)
+  legend("topleft", bty = "n", cex = .75, ncol = 2,
+         legend = c("학습 자료", "검증 자료", names(H$preds)),
+         col = c("black", "black", MODEL_COL[names(H$preds)]), pch = c(16, 1, rep(NA, 5)),
+         lty = c(NA, NA, MODEL_LTY[names(H$preds)]), lwd = 2)
+}
+dev.off()
+
+# =============================================================================
+# Part B. 논문 모형 재현 (연인원)
+# =============================================================================
+raw <- read.csv("templestay_2002to2025.csv", fileEncoding = "UTF-8-BOM")
+pd  <- data.frame(year = 2002:2023,
+                  n = c(raw$pday_total[raw$year <= 2021] / 1e4, 43.0, 54.6))   # 2022·23: 논문 표1 차분
+pd$t <- pd$year - 2001; pd$N <- cumsum(pd$n)
+
+# 논문 수치 (표1: 2002~2023 자료 모형의 예측 누적, 표2: 향후 예측 누적)
+paper_t1 <- data.frame(year = 2011:2023,
+  actual = c(204.9, 240.5, 278.9, 316.2, 357.3, 398.8, 447.5, 499.1, 552.0, 575.8, 601.6, 644.6, 699.2),
+  pred   = c(216.2, 254.0, 294.5, 337.5, 382.3, 428.3, 474.5, 520.3, 564.7, 607.0, 646.7, 683.1, 716.1))
+paper_t2 <- data.frame(year = c(2024, 2029, 2034, 2039, 2044, 2049),
+                       pred = c(745.4, 842.9, 883.9, 899.2, 904.6, 906.5))
+
+# 세 가지 방법으로 추정해 논문 모수와 비교
+cat("\n[B-1] 연인원 2002~2023 추정 — 논문: m=907.5, p=.01, q=.18\n")
+fits_pd <- lapply(BASS_METHODS, function(f) f(pd))
+print(round(t(sapply(fits_pd, function(r) c(p = r$p, q = r$q, m = r$m))), 4))
+cat("   (코로나 이전 2002~2019) — 논문: m=954.3, p=.01, q=.18\n")
+print(round(t(sapply(BASS_METHODS, function(f) { r <- f(pd[pd$year <= 2019, ]); c(p = r$p, q = r$q, m = r$m) })), 4))
+
+# OLS 로 확인된 경우: 논문의 "예측 누적"은 N=0 에서 출발해 이산형 식을 반복 적용한 경로와 일치하는가?
+ols_pd <- fits_pd$OLS
+path   <- ols_forecast(ols_pd$fit, 0, length(2002:2049))        # 2002~2049 연간 예측 경로
+cum_path <- setNames(cumsum(path), 2002:2049)
+rep_t1 <- transform(paper_t1, replicated = round(cum_path[as.character(year)], 1))
+rep_t1$diff_pct_paper <- round(100 * (paper_t1$actual - paper_t1$pred) / paper_t1$actual, 2)
+rep_t2 <- transform(paper_t2, replicated = round(cum_path[as.character(year)], 1))
+cat("\n[B-2] 표1 재현: 논문 예측 누적 vs 재현 (OLS 계수, N=0 에서 반복)\n"); print(rep_t1, row.names = FALSE)
+cat("\n[B-3] 표2 재현: 향후 예측 누적\n"); print(rep_t2, row.names = FALSE)
+write.csv(rbind(cbind(table = "표1", rep_t1[, c("year", "pred", "replicated")]),
+                cbind(table = "표2", rep_t2[, c("year", "pred", "replicated")])),
+          file.path("out", "04_paper_replication.csv"), row.names = FALSE)
+
+# 논문 모형이 말한 2024·2025 연간 수요 vs 실제 순인원 추세
+n_path <- setNames(path, 2002:2049)
+cat(sprintf("\n[B-4] 논문 모형의 연간 연인원 예측: 2023 %.1f만 → 2024 %.1f만 → 2025 %.1f만 (감소)\n",
+            n_path["2023"], n_path["2024"], n_path["2025"]))
+cat(sprintf("      실제 연인원 2023 = %.1f만. 실제 순인원은 2024 %+.1f%%, 2025 %+.1f%% (역대 최다 경신)\n",
+            54.6, 100 * (d$n[d$year == 2024] / d$n[d$year == 2023] - 1),
+            100 * (d$n[d$year == 2025] / d$n[d$year == 2024] - 1)))
+
+open_png("04_fig2_paper_replication.png", 1900, 800)
+par(mfrow = c(1, 2), mar = c(4, 4.5, 3, 1))
+yy <- 2002:2049
+plot(pd$year, pd$N, pch = 16, xlim = range(yy), ylim = c(0, 1000), xlab = "", ylab = "만 명(연인원)",
+     main = "누적 연인원: 논문 표1·표2 vs 재현")
+lines(yy, cum_path, col = METHOD_COL["OLS"], lwd = 2)
+points(paper_t1$year, paper_t1$pred, pch = 4, col = "red", cex = 1.2)
+points(paper_t2$year, paper_t2$pred, pch = 4, col = "red", cex = 1.2)
+abline(h = ols_pd$m, lty = 2, col = METHOD_COL["OLS"])
+legend("bottomright", bty = "n", cex = .8,
+       legend = c("실제 누적 연인원", "재현: OLS 이산형 반복 경로", "논문 표1·표2 수치", "재현 m"),
+       col = c("black", METHOD_COL["OLS"], "red", METHOD_COL["OLS"]),
+       pch = c(16, NA, 4, NA), lty = c(NA, 1, NA, 2), lwd = 2)
+
+plot(pd$year, pd$n, pch = 16, xlim = c(2002, 2040), ylim = c(0, 60), xlab = "", ylab = "만 명(연인원)",
+     main = "연간 연인원: 논문 모형의 예측 경로")
+lines(yy, n_path, col = METHOD_COL["OLS"], lwd = 2)
+abline(v = 2023.5, lty = 3)
+text(2024, 54, "논문 모형: 2024년 이후 감소\n실제 순인원:\n2024 +15.9%, 2025 +5.1%", pos = 4, cex = .75)
+dev.off()
+
+cat("\n그래프와 결과표를 'out' 폴더에 저장했습니다.\n")
+```
+
+### `05_rolling_origin.R`
+
+[파일 내려받기](files/05_rolling_origin.R){.btn-dl}
+
+```{.r filename="05_rolling_origin.R" .code-overflow-wrap}
+# =============================================================================
+# 05_rolling_origin.R
+# Bass 확산 모형 학습 — 5단계: 관측 시점을 늘려 가며 다시 추정 (rolling origin)
+#
+# 질문
+#   (1) 자료가 한 해씩 쌓일 때 m 과 "정점 연도" 추정은 어떻게 움직이는가?
+#       → m 이 수렴하는가, 아니면 누적값을 뒤쫓아 계속 커지는가?
+#       → 모형이 말하는 정점이 관측 끝 연도보다 앞(= 이미 지났다)에 놓이는가?
+#   참고: 코로나 연도를 추정에서 빼므로 T=2020, 2021 의 추정은 T=2019 와 같다
+#   (2) 여러 예측 시작 시점에서 평가하면 Bass 와 Naive/Drift 중 누가 나은가?
+#       (4단계의 검증 2회 → 여기서는 최대 16회. 운의 영향을 줄인다)
+#
+# 설정
+#   관측 끝 연도(origin) T = 2008, 2009, ..., 2025  (각 T 마다 2002~T 자료로 추정)
+#   코로나 2020~21 은 추정에서 제외 (3단계 '제외' 설정; 누적값에는 포함)
+#   예측 평가: 1년 앞, 3년 앞 연간 순인원. 대상 연도가 2020~21 이면 평가에서 제외
+#
+# 필요 파일: bass_functions.R, templestay_2002to2025.csv
+# 출력: out/05_*.png, out/05_rolling_estimates.csv, out/05_rolling_errors.csv
+# =============================================================================
+
+source("bass_functions.R")
+
+d <- load_templestay(start_year = 2002)
+d$covid <- as.integer(d$year %in% 2020:2021)
+d$N_lag <- c(0, head(d$N, -1))
+
+ols_forecast <- function(fit, N_start, h) {
+  cf <- coef(fit)[1:3]; out <- numeric(h); N <- N_start
+  for (i in 1:h) { n <- cf[1] + cf[2] * N + cf[3] * N^2; out[i] <- n; N <- N + n }
+  out
+}
+
+origins <- 2008:2025
+H <- 3                                                   # 최대 예측 시계
+est_rows <- list(); err_rows <- list()
+
+for (T in origins) {
+  tr  <- d[d$year <= T & d$covid == 0, ]
+  N_T <- d$N[d$year == T]
+  fits <- lapply(BASS_METHODS, function(f) f(tr))
+
+  # (1) 추정치 기록
+  for (k in names(fits)) {
+    r <- fits[[k]]
+    pk <- if (is.na(r$m)) c(t_star = NA) else bass_peak(r$p, r$q, r$m)
+    est_rows[[length(est_rows) + 1]] <- data.frame(
+      origin = T, method = k, p = r$p, q = r$q, m = r$m,
+      peak_year = 2001 + pk["t_star"], N_T = N_T, m_over_N = r$m / N_T, row.names = NULL)
+  }
+
+  # (2) 1~3년 앞 예측
+  fy <- (T + 1):(T + H); tf <- fy - 2001
+  preds <- list(
+    OLS     = if (is.na(fits$OLS$m)) rep(NA, H) else ols_forecast(fits$OLS$fit, N_T, H),
+    NLS_cum = with(fits$NLS_cum, if (is.na(m)) rep(NA, H) else bass_n(tf, p, q, m)),
+    NLS_inc = with(fits$NLS_inc, if (is.na(m)) rep(NA, H) else bass_n(tf, p, q, m)),
+    Naive   = rep(d$n[d$year == T], H),
+    Drift   = d$n[d$year == T] + (1:H) * mean(diff(tail(d$n[d$year <= T], 6))))
+  for (h in c(1, 3)) {
+    y <- T + h
+    if (y > max(d$year) || y %in% 2020:2021) next
+    act <- d$n[d$year == y]
+    for (k in names(preds))
+      err_rows[[length(err_rows) + 1]] <- data.frame(
+        origin = T, horizon = h, target = y, model = k,
+        pred = preds[[k]][h], actual = act, ape = abs(preds[[k]][h] - act) / act * 100)
+  }
+}
+est <- do.call(rbind, est_rows); err <- do.call(rbind, err_rows)
+write.csv(est, file.path("out", "05_rolling_estimates.csv"), row.names = FALSE)
+write.csv(err, file.path("out", "05_rolling_errors.csv"), row.names = FALSE)
+
+# -----------------------------------------------------------------------------
+# 결과 출력
+# -----------------------------------------------------------------------------
+cat("\n[1] 관측 끝 연도별 m 추정 (만 명) — 괄호: m / 그 시점 실제 누적\n")
+wide <- reshape(est[, c("origin", "method", "m", "m_over_N")], idvar = "origin",
+                timevar = "method", direction = "wide")
+show <- data.frame(origin = wide$origin, 누적 = round(est$N_T[est$method == "OLS"], 1))
+for (k in names(BASS_METHODS))
+  show[[k]] <- sprintf("%6.0f (%.1f배)", wide[[paste0("m.", k)]], wide[[paste0("m_over_N.", k)]])
+print(show, row.names = FALSE)
+
+cat("\n[2] 관측 끝 연도별 '모형이 말하는 정점 연도'\n")
+pk <- reshape(est[, c("origin", "method", "peak_year")], idvar = "origin", timevar = "method", direction = "wide")
+names(pk) <- sub("peak_year.", "", names(pk)); pk[-1] <- round(pk[-1], 1)
+print(pk, row.names = FALSE)
+
+cat("\n[3] Rolling origin 예측 오차 (MAPE %, 괄호: 평가 횟수)\n")
+agg <- aggregate(ape ~ model + horizon, err, function(v) c(mape = mean(v), n = length(v)))
+agg <- data.frame(model = agg$model, horizon = agg$horizon,
+                  MAPE = round(agg$ape[, "mape"], 1), n = agg$ape[, "n"])
+tab <- reshape(agg, idvar = "model", timevar = "horizon", direction = "wide")
+tab <- tab[match(c("OLS", "NLS_cum", "NLS_inc", "Naive", "Drift"), tab$model), ]
+names(tab) <- c("model", "1년앞 MAPE", "1년앞 n", "3년앞 MAPE", "3년앞 n")
+print(tab, row.names = FALSE)
+
+# 각 평가에서 1등을 몇 번 했나 (1년 앞)
+win <- do.call(rbind, lapply(split(err[err$horizon == 1, ], err$origin[err$horizon == 1]),
+                             function(x) x[which.min(x$ape), c("origin", "model")]))
+cat("\n[4] 1년 앞 예측에서 가장 정확했던 모형 (횟수)\n"); print(table(win$model))
+
+# -----------------------------------------------------------------------------
+# 그림 1 — m 추정치의 궤적 vs 실제 누적
+# -----------------------------------------------------------------------------
+open_png("05_fig1_m_path.png", 1900, 800)
+par(mfrow = c(1, 2), mar = c(4, 4.5, 3, 1))
+plot(NA, xlim = range(origins), ylim = c(0, max(est$m, na.rm = TRUE) * 1.05),
+     xlab = "관측 끝 연도 T", ylab = "만 명", main = "추정된 m 의 궤적 (자료를 T 년까지 사용)")
+u <- par("usr"); rect(2019.5, u[3], 2021.5, u[4], col = adjustcolor("red", .08), border = NA)
+for (k in names(BASS_METHODS)) with(est[est$method == k, ], lines(origin, m, type = "b", pch = 16, col = METHOD_COL[k], lwd = 2))
+with(est[est$method == "OLS", ], lines(origin, N_T, lwd = 2, lty = 2))
+legend("topleft", bty = "n", cex = .8, legend = c(names(BASS_METHODS), "그 시점 실제 누적 N(T)"),
+       col = c(METHOD_COL, "black"), lty = c(1, 1, 1, 2), pch = c(16, 16, 16, NA), lwd = 2)
+
+plot(NA, xlim = range(origins), ylim = c(1, max(est$m_over_N, na.rm = TRUE) * 1.05), log = "y",
+     xlab = "관측 끝 연도 T", ylab = "m / N(T)  (로그 눈금)", main = "m 은 누적의 몇 배? (1 = 이미 포화)")
+u <- par("usr"); rect(2019.5, u[3], 2021.5, u[4], col = adjustcolor("red", .08), border = NA)
+for (k in names(BASS_METHODS)) with(est[est$method == k, ], lines(origin, m_over_N, type = "b", pch = 16, col = METHOD_COL[k], lwd = 2))
+abline(h = 1, lty = 3)
+dev.off()
+
+# -----------------------------------------------------------------------------
+# 그림 2 — 정점 연도 추정 vs 관측 끝 연도 (대각선 = "지금이 정점")
+# -----------------------------------------------------------------------------
+open_png("05_fig2_peak_path.png", 1100, 900)
+par(mar = c(4.5, 4.5, 3, 1))
+yl <- range(c(est$peak_year, origins), na.rm = TRUE)
+plot(NA, xlim = range(origins), ylim = yl, xlab = "관측 끝 연도 T", ylab = "모형이 말하는 정점 연도",
+     main = "모형은 거의 늘 '정점은 이미 지났다'고 말한다")
+abline(0, 1, lty = 2, col = "grey40")
+text(2021, 2021.6, "정점 = 관측 끝 연도\n(선 아래 = 이미 지났다고 판단)", pos = 2, cex = .75, col = "grey40")
+for (k in names(BASS_METHODS)) with(est[est$method == k, ], lines(origin, peak_year, type = "b", pch = 16, col = METHOD_COL[k], lwd = 2))
+legend("topleft", bty = "n", cex = .8, legend = names(BASS_METHODS), col = METHOD_COL, lwd = 2, pch = 16)
+dev.off()
+
+# -----------------------------------------------------------------------------
+# 그림 3 — 대표 시점(2010·2013·2016·2019·2025)의 증분 NLS 곡선
+# -----------------------------------------------------------------------------
+sel <- c(2010, 2013, 2016, 2019, 2025)
+scol <- c("#fdae61", "#f46d43", "#d73027", "#74add1", "#313695")
+yy <- 2002:2050
+open_png("05_fig3_curves.png", 1500, 800)
+par(mar = c(4, 4.5, 3, 1))
+plot(d$year, d$n, pch = 16, col = ifelse(d$covid == 1, "red", "black"), xlim = range(yy), ylim = c(0, 40),
+     xlab = "", ylab = "만 명", main = "증분 NLS: 관측 끝 연도별 적합 곡선 (세로 점선 = 관측 끝)")
+for (i in seq_along(sel)) {
+  r <- est[est$method == "NLS_inc" & est$origin == sel[i], ]
+  lines(yy, bass_n(yy - 2001, r$p, r$q, r$m), col = scol[i], lwd = 2)
+  abline(v = sel[i] + .5, col = scol[i], lty = 3)
+}
+legend("topright", bty = "n", cex = .8, legend = paste0("~", sel, "  m=", round(est$m[est$method == "NLS_inc" & est$origin %in% sel])),
+       col = scol, lwd = 2)
+dev.off()
+
+cat("\n그래프와 결과표를 'out' 폴더에 저장했습니다.\n")
+```
+
+### `06_supply_scenarios.R`
+
+[파일 내려받기](files/06_supply_scenarios.R){.btn-dl}
+
+```{.r filename="06_supply_scenarios.R" .code-overflow-wrap}
+# =============================================================================
+# 06_supply_scenarios.R
+# Bass 확산 모형 학습 — 6단계: 공급(사찰 수)을 반영한 확장 모형과 정책 시나리오
+#
+# 정책 질문: "사찰 수(공급)를 그대로 두면 수요는 어디서 멈추고,
+#             공급을 늘리면 그 천장이 얼마나 올라가는가?"
+#
+# 모형 (모두 순인원, 코로나 2020~21 은 추정에서 제외)
+#   [M0] 고정 m Bass (이산형 NLS)
+#        n_t = [p + q N_{t-1}/m] (m - N_{t-1})
+#   [M1] 동적 m Bass: 공급이 "천장"을 올린다 (Mahajan & Peterson 1978 계열)
+#        n_t = [p + q N_{t-1}/m_t] (m_t - N_{t-1}),   m_t = k × 사찰수_t
+#        k = 사찰 1곳이 떠받치는 잠재 참가자 규모(만 명)
+#   [M2] Generalized Bass: 공급이 "속도"를 올린다 (Bass, Krishnan & Jain 1994)
+#        n_t = m [F(τ_t) - F(τ_{t-1})],  τ_t = Σ x_s,  x_s = 1 + β Δln(사찰수_s)
+#        비교 기준은 같은 곡선형인 [M2-0] 증분 NLS (β = 0 인 경우)
+#   * M0·M1 은 실제 전년 누적 N_{t-1} 을 쓰는 "한 해씩" 형태, M2 는 곡선형이라
+#     적합도(RSS)는 같은 형태끼리 비교한다: M0 vs M1, M2-0 vs M2
+#
+# 시나리오 (2026~2035 사찰 수)
+#   동결 : 2025년 158곳 유지
+#   추세 : 2015~2025 연평균 증가 폭만큼 매년 증가
+#   확대 : 매년 +6곳 (정책 지원 가정)
+#
+# 민감도 분석 (5절): 공급 확대의 "질"이 떨어지면?
+#   α     : 신규 사찰의 효율 (기존 사찰 대비 잠재시장 기여 비율)  m_t = k × [158 + α × (사찰_t - 158)]
+#   q 배수 : 구전 효과 변화 (신규 사찰 만족도 하락 → 부정적 입소문이 전체 q 를 낮춤)
+#            신규 사찰이 늘어나는 만큼 점진적으로 하락해 2035년에 해당 배수에 도달한다고 가정
+#   비교 기준은 '동결'(α, q 변화 없음)
+#
+# 필요 파일: bass_functions.R, templestay_2002to2025.csv
+# 출력: out/06_*.png, out/06_models.csv, out/06_scenarios.csv, out/06_sensitivity.csv
+# =============================================================================
+
+source("bass_functions.R")
+set.seed(2026)
+
+d <- load_templestay(start_year = 2002)
+d$S     <- d$temples
+d$N_lag <- c(0, head(d$N, -1))
+d$covid <- d$year %in% 2020:2021
+d$dlS   <- c(0, diff(log(d$S)))
+e <- d[!d$covid, ]                                   # 추정용 자료
+
+# -----------------------------------------------------------------------------
+# 1. 모형 추정
+# -----------------------------------------------------------------------------
+multi_nls <- function(formula, data, starts, lower, upper) {
+  best <- NULL
+  for (st in starts) {
+    f <- tryCatch(nls(formula, data, start = st, algorithm = "port", lower = lower, upper = upper,
+                      control = nls.control(maxiter = 1000)), error = function(e) NULL)
+    if (!is.null(f) && (is.null(best) || deviance(f) < deviance(best))) best <- f
+  }
+  best
+}
+fit_M0 <- function(data) multi_nls(n ~ (p + q * N_lag / m) * (m - N_lag), data,
+  starts = lapply(c(1.5, 2, 3), function(k) list(p = .01, q = .15, m = k * max(data$N))),
+  lower = c(p = 1e-6, q = 1e-5, m = max(data$N_lag) + 1), upper = c(p = 1, q = 3, m = 1e5))
+fit_M1 <- function(data) multi_nls(n ~ (p + q * N_lag / (k * S)) * (k * S - N_lag), data,
+  starts = lapply(c(1.2, 2, 4), function(a) list(p = .01, q = .15, k = a * max(data$N_lag / data$S) + .1)),
+  lower = c(p = 1e-6, q = 1e-5, k = max(data$N_lag / data$S) + 1e-3), upper = c(p = 1, q = 3, k = 1e3))
+
+M0 <- fit_M0(e); M1 <- fit_M1(e)
+
+# M2: 누적 시계 τ 에 공급 증가율을 반영 (nls 대신 optim — τ 가 모든 연도에 걸친 누적이므로)
+gbm_path <- function(par, dlS) {                       # par = (p, q, m, beta)
+  x <- pmax(1 + par[4] * dlS, 0.01); tau <- cumsum(x)
+  Fv <- bass_F(tau, par[1], par[2]); par[3] * (Fv - c(0, head(Fv, -1)))
+}
+fit_curve <- function(with_beta) {
+  obj <- function(par) { if (!with_beta) par[4] <- 0
+    sum((d$n[!d$covid] - gbm_path(par, d$dlS)[!d$covid])^2) }
+  best <- NULL
+  for (b0 in if (with_beta) c(0, .5, 1, 2) else 0) for (m0 in c(500, 900, 1500)) {
+    o <- optim(c(.007, .15, m0, b0), obj, method = "L-BFGS-B",
+               lower = c(1e-5, 1e-4, max(d$N), -2), upper = c(.5, 2, 1e5, 10))
+    if (is.null(best) || o$value < best$value) best <- o }
+  par <- best$par; if (!with_beta) par[4] <- 0
+  list(par = setNames(par, c("p", "q", "m", "beta")), rss = best$value)
+}
+M2_0 <- fit_curve(FALSE); M2 <- fit_curve(TRUE)
+
+n_obs <- nrow(e)
+aic <- function(rss, k) n_obs * log(rss / n_obs) + 2 * k
+models <- data.frame(
+  model = c("M0 고정m", "M1 동적m(k×사찰)", "M2-0 증분NLS", "M2 GBM(공급→속도)"),
+  p = c(coef(M0)["p"], coef(M1)["p"], M2_0$par["p"], M2$par["p"]),
+  q = c(coef(M0)["q"], coef(M1)["q"], M2_0$par["q"], M2$par["q"]),
+  m_or_k = c(coef(M0)["m"], coef(M1)["k"], M2_0$par["m"], M2$par["m"]),
+  beta = c(NA, NA, 0, M2$par["beta"]),
+  RSS = c(deviance(M0), deviance(M1), M2_0$rss, M2$rss),
+  AIC = c(aic(deviance(M0), 3), aic(deviance(M1), 3), aic(M2_0$rss, 3), aic(M2$rss, 4)), row.names = NULL)
+write.csv(models, file.path("out", "06_models.csv"), row.names = FALSE)
+
+cat("\n[1] 모형 비교 (순인원, 코로나 제외; M1 의 m_or_k 는 k = 사찰 1곳당 잠재 참가자, 만 명)\n")
+print(transform(models, p = round(p, 4), q = round(q, 3), m_or_k = round(m_or_k, 2),
+                beta = round(beta, 3), RSS = round(RSS, 1), AIC = round(AIC, 1)), row.names = FALSE)
+cat("\n   M1 표준오차:\n"); print(round(summary(M1)$coefficients[, 1:2], 4))
+k_hat <- coef(M1)["k"]
+cat(sprintf("\n   M1 해석: 2025년 사찰 158곳 → 잠재시장 m = %.2f × 158 = %.0f만 명 (2025 누적 %.0f만 = %.0f%%)\n",
+            k_hat, k_hat * 158, tail(d$N, 1), 100 * tail(d$N, 1) / (k_hat * 158)))
+
+# -----------------------------------------------------------------------------
+# 2. 검증: 1년 앞 rolling 예측 (M1 은 다음 해 실제 사찰 수를 안다고 가정한 "조건부 예측")
+# -----------------------------------------------------------------------------
+step_M0 <- function(cf, N) (cf["p"] + cf["q"] * N / cf["m"]) * (cf["m"] - N)
+step_M1 <- function(cf, N, S) (cf["p"] + cf["q"] * N / (cf["k"] * S)) * (cf["k"] * S - N)
+roll <- list()
+for (T in 2010:2024) {
+  y <- T + 1; if (y %in% 2020:2021) next
+  tr <- e[e$year <= T, ]; a0 <- fit_M0(tr); a1 <- fit_M1(tr)
+  N_T <- d$N[d$year == T]; act <- d$n[d$year == y]
+  roll[[length(roll) + 1]] <- data.frame(origin = T, target = y, actual = act,
+    M0 = if (is.null(a0)) NA else step_M0(coef(a0), N_T),
+    M1 = if (is.null(a1)) NA else step_M1(coef(a1), N_T, d$S[d$year == y]),
+    Naive = d$n[d$year == T])
+}
+roll <- do.call(rbind, roll)
+ape <- function(p) round(mean(abs(p - roll$actual) / roll$actual, na.rm = TRUE) * 100, 1)
+cat(sprintf("\n[2] 1년 앞 rolling 예측 MAPE (%d회): M0 고정m %.1f%% | M1 동적m %.1f%% | Naive %.1f%%\n",
+            nrow(roll), ape(roll$M0), ape(roll$M1), ape(roll$Naive)))
+
+# -----------------------------------------------------------------------------
+# 3. 시나리오 예측 (M1) + 부트스트랩 불확실성
+# -----------------------------------------------------------------------------
+fy <- 2026:2035; h <- length(fy)
+trend <- (d$S[d$year == 2025] - d$S[d$year == 2015]) / 10
+scen <- list(
+  "동결"   = rep(158, h),
+  "추세"   = 158 + trend * (1:h),
+  "확대"   = 158 + 6 * (1:h))
+project_M1 <- function(cf, Spath) {
+  N <- tail(d$N, 1); out <- numeric(h)
+  for (i in 1:h) { n <- max(step_M1(cf, N, Spath[i]), 0); out[i] <- n; N <- N + n }
+  out
+}
+project_M0 <- function(cf) {
+  N <- tail(d$N, 1); out <- numeric(h)
+  for (i in 1:h) { n <- max(step_M0(cf, N), 0); out[i] <- n; N <- N + n }
+  out
+}
+point <- sapply(scen, function(S) project_M1(coef(M1), S))
+ref_M0 <- project_M0(coef(M0))
+
+# 잔차 부트스트랩: 적합값 + 재표집 잔차로 자료를 다시 만들어 M1 재추정 → 시나리오 재예측
+B <- 300; fit_e <- fitted(M1); res_e <- resid(M1)
+boot <- array(NA, c(B, h, length(scen)))
+for (b in 1:B) {
+  eb <- e; eb$n <- fit_e + sample(res_e, replace = TRUE)
+  fb <- fit_M1(eb); if (is.null(fb)) next
+  for (s in seq_along(scen)) boot[b, , s] <- project_M1(coef(fb), scen[[s]])
+}
+lo <- apply(boot, c(2, 3), quantile, .1, na.rm = TRUE)
+hi <- apply(boot, c(2, 3), quantile, .9, na.rm = TRUE)
+
+tab <- do.call(rbind, lapply(seq_along(scen), function(s) data.frame(
+  scenario = names(scen)[s], year = fy, temples = round(scen[[s]], 1),
+  n = point[, s], n_lo80 = lo[, s], n_hi80 = hi[, s],
+  N = tail(d$N, 1) + cumsum(point[, s]))))
+write.csv(tab, file.path("out", "06_scenarios.csv"), row.names = FALSE)
+
+cat(sprintf("\n[3] 시나리오 (M1 동적m). 추세 = 2015~2025 평균 +%.1f곳/년. 괄호 = 80%% 부트스트랩 구간\n", trend))
+for (s in names(scen)) {
+  x <- tab[tab$scenario == s, ]
+  cat(sprintf("   %-4s 2035 사찰 %5.1f곳 | 연간 순인원 2030 %.1f만 (%.1f~%.1f), 2035 %.1f만 (%.1f~%.1f) | 누적 2035 %.0f만\n",
+              s, x$temples[h], x$n[5], x$n_lo80[5], x$n_hi80[5], x$n[h], x$n_lo80[h], x$n_hi80[h], x$N[h]))
+}
+cat(sprintf("   참고: M0 고정m 이면 연간 순인원 2030 %.1f만, 2035 %.1f만 (공급과 무관하게 감소)\n", ref_M0[5], ref_M0[h]))
+
+cat("\n[4] 공급 확대의 한계 효과 (동결 대비)\n")
+for (s in c("추세", "확대")) {
+  dS  <- scen[[s]][h] - 158
+  dN  <- sum(point[, s]) - sum(point[, "동결"])
+  dn  <- point[h, s] - point[h, "동결"]
+  cat(sprintf("   %s: 2035년까지 사찰 +%.0f곳 → 10년 누적 +%.1f만 명, 2035년 연간 +%.1f만 명 (사찰 1곳당 연 %.0f명)\n",
+              s, dS, dN, dn, 1e4 * dn / dS))
+}
+cat(sprintf("   비교: 2025년 실제 사찰당 순인원 = %.0f명\n", d$uniq_total[d$year == 2025] / 158))
+
+# -----------------------------------------------------------------------------
+# 4. 그림
+# -----------------------------------------------------------------------------
+SC_COL <- c("동결" = "#8a8a8a", "추세" = "#2f6db5", "확대" = "#d9822b")
+
+# 그림 1: 적합 비교 (M0 vs M1, 한 해씩 적합값)
+open_png("06_fig1_fit.png", 1900, 800)
+par(mfrow = c(1, 2), mar = c(4, 4.5, 3, 4))
+f0 <- step_M0(coef(M0), d$N_lag); f1 <- step_M1(coef(M1), d$N_lag, d$S)
+plot(d$year, d$n, pch = 16, col = ifelse(d$covid, "red", "black"), ylim = c(0, 40),
+     xlab = "", ylab = "만 명", main = "연간 순인원: 고정 m(M0) vs 동적 m(M1) 적합")
+lines(d$year, f0, col = "#8a8a8a", lwd = 2); lines(d$year, f1, col = "#2f6db5", lwd = 2)
+legend("topleft", bty = "n", cex = .8, legend = c("실제", "실제(코로나, 추정 제외)",
+       sprintf("M0 고정 m (RSS %.0f)", deviance(M0)), sprintf("M1 동적 m (RSS %.0f)", deviance(M1))),
+       col = c("black", "red", "#8a8a8a", "#2f6db5"), pch = c(16, 16, NA, NA), lty = c(NA, NA, 1, 1), lwd = 2)
+
+plot(d$year, d$N, pch = 16, ylim = c(0, max(k_hat * d$S, coef(M0)["m"]) * 1.05), xlab = "",
+     ylab = "만 명", main = "누적 순인원과 잠재시장: 고정 m vs 동적 m = k × 사찰수")
+lines(d$year, k_hat * d$S, col = "#2f6db5", lwd = 2, type = "s")
+abline(h = coef(M0)["m"], col = "#8a8a8a", lwd = 2, lty = 2)
+legend("topleft", bty = "n", cex = .8, legend = c("실제 누적", "M1 동적 m (k×사찰수)", "M0 고정 m"),
+       col = c("black", "#2f6db5", "#8a8a8a"), pch = c(16, NA, NA), lty = c(NA, 1, 2), lwd = 2)
+dev.off()
+
+# 그림 2: 시나리오
+open_png("06_fig2_scenarios.png", 1900, 800)
+par(mfrow = c(1, 2), mar = c(4, 4.5, 3, 1))
+plot(d$year, d$n, pch = 16, col = ifelse(d$covid, "red", "black"), xlim = c(2002, 2035),
+     ylim = c(0, max(hi, na.rm = TRUE) * 1.05), xlab = "", ylab = "만 명",
+     main = "연간 순인원: 사찰 수 시나리오별 예측 (음영 = 80% 구간)")
+for (s in names(scen)) {
+  i <- match(s, names(scen))
+  polygon(c(fy, rev(fy)), c(lo[, i], rev(hi[, i])), col = adjustcolor(SC_COL[s], .18), border = NA)
+  lines(c(2025, fy), c(tail(d$n, 1), point[, s]), col = SC_COL[s], lwd = 2)
+}
+lines(c(2025, fy), c(tail(d$n, 1), ref_M0), col = "black", lty = 3, lwd = 2)
+abline(v = 2025.5, lty = 3, col = "grey60")
+legend("topleft", bty = "n", cex = .8, legend = c(sprintf("동결 (158곳)"), sprintf("추세 (+%.1f곳/년)", trend),
+       "확대 (+6곳/년)", "참고: 고정 m 모형"), col = c(SC_COL, "black"), lty = c(1, 1, 1, 3), lwd = 2)
+
+plot(d$year, d$S, type = "b", pch = 16, xlim = c(2002, 2035), ylim = c(0, max(unlist(scen)) * 1.05),
+     xlab = "", ylab = "사찰 수", main = "시나리오별 사찰 수 경로")
+for (s in names(scen)) lines(c(2025, fy), c(158, scen[[s]]), col = SC_COL[s], lwd = 2)
+dev.off()
+
+# -----------------------------------------------------------------------------
+# 5. 민감도 분석: 신규 사찰 효율(α) × 구전 효과 변화(q 배수)
+# -----------------------------------------------------------------------------
+# q 하락은 신규 사찰이 쌓이는 만큼 점진적으로 나타난다고 가정:
+#   q 배수_t = 1 - (1 - qmult) × (신규 사찰_t / 2035년 신규 사찰)  → 2035년에 qmult 도달
+project_M1_sens <- function(cf, Spath, alpha = 1, qmult = 1) {
+  N <- tail(d$N, 1); out <- numeric(h)
+  new_share <- if (Spath[h] > 158) (Spath - 158) / (Spath[h] - 158) else rep(0, h)
+  for (i in 1:h) {
+    m  <- cf["k"] * (158 + alpha * (Spath[i] - 158))
+    qm <- 1 - (1 - qmult) * new_share[i]
+    n <- max((cf["p"] + cf["q"] * qm * N / m) * (m - N), 0)
+    out[i] <- n; N <- N + n
+  }
+  out
+}
+alphas <- c(1, .75, .5, .25); qmults <- c(1, .9, .8)
+base_freeze <- project_M1_sens(coef(M1), scen[["동결"]])
+sens <- do.call(rbind, lapply(c("추세", "확대"), function(s) do.call(rbind, lapply(qmults, function(qm)
+  do.call(rbind, lapply(alphas, function(a) {
+    x <- project_M1_sens(coef(M1), scen[[s]], a, qm)
+    dS <- scen[[s]][h] - 158
+    data.frame(scenario = s, alpha = a, q_mult = qm, n_2035 = x[h],
+               gain_cum10 = sum(x) - sum(base_freeze),
+               gain_per_temple_2035 = 1e4 * (x[h] - base_freeze[h]) / dS)
+  }))))))
+write.csv(sens, file.path("out", "06_sensitivity.csv"), row.names = FALSE)
+
+cat(sprintf("\n[5] 민감도: 확대 시나리오 (동결 대비, 동결 2035 연간 = %.1f만)\n", base_freeze[h]))
+sx <- sens[sens$scenario == "확대", ]
+cat("   10년 누적 효과(만 명) — 행: q 배수, 열: 신규 사찰 효율 α\n")
+g <- xtabs(gain_cum10 ~ q_mult + alpha, sx); g <- g[order(-as.numeric(rownames(g))), order(-as.numeric(colnames(g)))]
+print(round(g, 1))
+cat("   2035년 연간 순인원(만 명)\n")
+g2 <- xtabs(n_2035 ~ q_mult + alpha, sx); g2 <- g2[order(-as.numeric(rownames(g2))), order(-as.numeric(colnames(g2)))]
+print(round(g2, 1))
+neg <- sx[sx$gain_cum10 < 0, ]
+if (nrow(neg)) cat(sprintf("   ※ %d개 조합에서 확대가 동결보다 오히려 손해 (구전 효과 하락이 공급 효과를 상쇄)\n", nrow(neg)))
+
+# 그림 3: 민감도
+open_png("06_fig3_sensitivity.png", 1900, 800)
+par(mfrow = c(1, 2), mar = c(4.5, 4.5, 3, 1))
+QCOL <- c("1" = "#2f6db5", "0.9" = "#d9822b", "0.8" = "#c0392b")
+plot(NA, xlim = c(1, .25), ylim = range(c(sx$gain_cum10, 0)), xlab = "신규 사찰 효율 α (기존 = 1)",
+     ylab = "10년 누적 효과 (만 명, 동결 대비)", main = "확대 시나리오의 효과: α × 구전 효과")
+abline(h = 0, lty = 3)
+for (qm in qmults) with(sx[sx$q_mult == qm, ], lines(alpha, gain_cum10, type = "b", pch = 16, lwd = 2, col = QCOL[as.character(qm)]))
+legend("topright", bty = "n", cex = .8, title = "q 배수", legend = c("1.0 (변화 없음)", "0.9", "0.8"), col = QCOL, lwd = 2, pch = 16)
+
+plot(d$year, d$n, pch = 16, col = ifelse(d$covid, "red", "black"), xlim = c(2002, 2035), ylim = c(0, 45),
+     xlab = "", ylab = "만 명", main = "확대(+6곳/년) 경로: 질 관리에 따라")
+combos <- list(c(1, 1), c(.75, 1), c(.5, 1), c(.75, .8))
+ccol <- c("#d9822b", "#2f6db5", "#7b3294", "#c0392b")
+for (i in seq_along(combos)) lines(c(2025, fy), c(tail(d$n, 1), project_M1_sens(coef(M1), scen[["확대"]], combos[[i]][1], combos[[i]][2])), col = ccol[i], lwd = 2)
+lines(c(2025, fy), c(tail(d$n, 1), base_freeze), col = "grey50", lwd = 2, lty = 2)
+legend("topleft", bty = "n", cex = .8, col = c(ccol, "grey50"), lwd = 2, lty = c(1, 1, 1, 1, 2),
+       legend = c(sprintf("α=%.2f, q×%.1f", sapply(combos, `[`, 1), sapply(combos, `[`, 2)), "동결"))
+dev.off()
+
+cat("\n그래프와 결과표를 'out' 폴더에 저장했습니다.\n")
+```
+
