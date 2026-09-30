@@ -867,6 +867,4 @@ BassModel/
 - Srinivasan, V., & Mason, C. H. (1986). Nonlinear least squares estimation of new product diffusion models. *Marketing Science*, 5(2), 169–178.
 - Sultan, F., Farley, J. U., & Lehmann, D. R. (1990). A meta-analysis of applications of diffusion models. *Journal of Marketing Research*, 27(1), 70–77.
 
----
 
-*작성: 2026년 9월 · 분석 도구: R (base R) · 문의 및 수정 제안은 정진우(jinwoo.chung@kstat.co.kr)에게 해주세요.*
