@@ -1,0 +1,526 @@
+# =============================================================================
+# 그레인저 인과 검정 실습 2단계: 구글 검색량 ↔ 방한 일본인 관광객 (월별)
+# -----------------------------------------------------------------------------
+# 자료 : case2_tourism/일본_관광객수_구글트렌드_201501to202608.xlsx
+#        - 외래관광객수_전체 : 한국관광 데이터랩, 일본 국적 월별 입국자 수
+#        - 구글트렌드        : Google Trends "韓国旅行" (지역: 일본), 월별 0~100
+#        - 기간              : 2015-01 ~ 2026-08, 140개월
+#
+# 질문 : 일본에서의 "韓国旅行" 검색량이 방한 일본인 관광객 수를 선행하는가?
+#        (반대 방향도 함께 검정)
+#
+# 1단계(ChickEgg)에서 배운 점을 처음부터 반영합니다.
+#   - 계절성: 검색은 1월, 방문은 3월이 성수기 → 계절성을 먼저 제거
+#   - 구조적 단절: 코로나(2020-03 ~ 2022-12) → 전·후 구간을 나눠 분석
+#   - 잔차 진단과 이분산 강건 검정을 본 분석에 포함
+#
+# 실행 방법
+#   - 이 스크립트와 엑셀 파일이 있는 case2_tourism 폴더를 작업 폴더로 지정
+#     (RStudio: Session > Set Working Directory > To Source File Location)
+#   - 0절을 먼저 실행한 뒤 절 단위로 실행하세요.
+#   - vars 패키지 없이 동작합니다 (시차 선택·부트스트랩을 직접 구현).
+# =============================================================================
+
+
+# ---- 0. 패키지 · 설정 · 도우미 함수 ------------------------------------------
+pkgs <- c("readxl", "lmtest", "sandwich", "tseries")
+for (pk in pkgs) if (!requireNamespace(pk, quietly = TRUE)) install.packages(pk)
+library(readxl); library(lmtest); library(sandwich); library(tseries)
+
+# setwd("C:/Work/models/GrangerCausality/case2_tourism")   # 필요하면 직접 지정
+data_file <- "일본_관광객수_구글트렌드_201501to202608.xlsx"
+
+# 분석 구간 (코로나 단절 제외)
+PRE  <- c(201501, 202002)   # 코로나 이전: 2015-01 ~ 2020-02 (62개월)
+POST <- c(202301, 202608)   # 코로나 이후: 2023-01 ~ 2026-08 (44개월)
+MAXLAG <- 6                 # 월별 자료에서 검토할 최대 시차(개월)
+
+# ---- 도우미 1: 시차 변수 만들기 ----------------------------------------------
+# df의 vars 열에 대해 [t, t-1, ..., t-p] 열을 만들고, keep 열은 t 시점 값을 붙임
+build_lags <- function(df, vars, p, keep = NULL) {
+  n <- nrow(df)
+  out <- df[(p + 1):n, c(vars, keep), drop = FALSE]
+  for (v in vars) for (k in 1:p) out[[paste0(v, "_L", k)]] <- df[[v]][(p + 1 - k):(n - k)]
+  rownames(out) <- NULL
+  out
+}
+
+# ---- 도우미 2: 그레인저 검정 (일반 F + 이분산 강건 HC3) -----------------------
+#   y ~ y의 과거 p개 [+ extra] (제약)  vs  + x의 과거 p개 (비제약)
+#   test_p: 검정할 x 시차 수 (Toda–Yamamoto에서는 p보다 작게 줌)
+granger_test <- function(dat, y, x, p, extra = NULL, test_p = p) {
+  own   <- paste0(y, "_L", 1:p)
+  cause <- paste0(x, "_L", 1:p)
+  m1 <- lm(reformulate(c(own, cause, extra), response = y), data = dat)
+  tested <- paste0(x, "_L", 1:test_p)
+  w_cl <- waldtest(m1, tested, test = "F")
+  w_hc <- waldtest(m1, tested, test = "F", vcov = vcovHC(m1, type = "HC3"))
+  list(model = m1, n = nobs(m1),
+       F = w_cl$F[2], p_classic = w_cl$`Pr(>F)`[2],
+       F_hc = w_hc$F[2], p_HC3 = w_hc$`Pr(>F)`[2])
+}
+
+# ---- 도우미 3: 시차 선택 (vars::VARselect와 같은 공식) ----------------------
+#   AIC = ln|Σ| + 2pK²/T,  HQ = ln|Σ| + 2ln(lnT)pK²/T,  SC = ln|Σ| + ln(T)pK²/T
+#   모든 시차 후보를 같은 표본(앞의 maxlag개 제외)으로 비교
+select_lag <- function(df, vars, maxlag, extra = NULL) {
+  K <- length(vars)
+  full <- build_lags(df, vars, maxlag, keep = extra)
+  Tn <- nrow(full)
+  res <- t(sapply(1:maxlag, function(p) {
+    rhs <- c(unlist(lapply(vars, function(v) paste0(v, "_L", 1:p))), extra)
+    E <- sapply(vars, function(v) resid(lm(reformulate(rhs, response = v), data = full)))
+    S <- crossprod(E) / Tn
+    ld <- log(det(S)); pen <- p * K^2 / Tn
+    c(AIC = ld + 2 * pen, HQ = ld + 2 * log(log(Tn)) * pen, SC = ld + log(Tn) * pen)
+  }))
+  list(table = round(res, 3), selection = apply(res, 2, which.min), T = Tn)
+}
+
+# ---- 도우미 4: wild bootstrap p값 (이분산에 강건) ----------------------------
+#   제약모형(인과 없음)의 적합값 + 잔차 × 무작위 부호(±1)로 가상 y를 만들고,
+#   HC3 Wald 통계량의 분포를 직접 구함 (Gonçalves & Kilian, 2004 방식의 단순형)
+wild_boot <- function(dat, y, x, p, extra = NULL, test_p = p, B = 9999, seed = 1) {
+  own <- paste0(y, "_L", 1:p); cause <- paste0(x, "_L", 1:p)
+  X1 <- model.matrix(reformulate(c(own, cause, extra)), data = dat)
+  X0 <- X1[, !(colnames(X1) %in% paste0(x, "_L", 1:test_p)), drop = FALSE]
+  idx <- which(colnames(X1) %in% paste0(x, "_L", 1:test_p))
+  yv <- dat[[y]]
+  hc3_wald <- function(yy) {
+    q <- qr(X1); b <- qr.coef(q, yy); e <- yy - X1 %*% b
+    h <- rowSums(qr.Q(q)^2)
+    bread <- chol2inv(qr.R(q))
+    meat <- crossprod(X1 * as.vector(e / (1 - h)))
+    V <- bread %*% meat %*% bread
+    as.numeric(t(b[idx]) %*% solve(V[idx, idx, drop = FALSE], b[idx]))
+  }
+  W_obs <- hc3_wald(yv)
+  f0 <- lm.fit(X0, yv); fit0 <- yv - f0$residuals; e0 <- f0$residuals
+  set.seed(seed)
+  W_b <- replicate(B, hc3_wald(fit0 + e0 * sample(c(-1, 1), length(e0), replace = TRUE)))
+  (1 + sum(W_b >= W_obs)) / (B + 1)
+}
+
+
+# ---- 1. 자료 불러오기와 살펴보기 ---------------------------------------------
+raw <- read_excel(data_file, .name_repair = "minimal")
+d <- data.frame(ym       = as.integer(raw[[2]]),        # 201501 형식
+                visitors = as.numeric(raw[[4]]),        # 외래관광객수_전체
+                trend    = as.numeric(raw[[5]]))        # 구글트렌드
+d$year  <- d$ym %/% 100
+d$month <- d$ym %% 100
+d$date  <- as.Date(sprintf("%d-%02d-01", d$year, d$month))
+str(d); range(d$ym); nrow(d)          # 140개월
+
+# 그림 1: 원자료 (두 축)
+op <- par(mar = c(4, 4, 3, 4))
+plot(d$date, d$visitors / 1000, type = "l", lwd = 2, col = "steelblue",
+     xlab = "", ylab = "visitors (thousand)", main = "Japan: visitors vs Google Trends")
+par(new = TRUE)
+plot(d$date, d$trend, type = "l", lwd = 2, col = "firebrick", axes = FALSE,
+     xlab = "", ylab = "")
+axis(4); mtext("Google Trends (0-100)", side = 4, line = 2.5)
+rect(as.Date("2020-03-01"), -10, as.Date("2022-12-01"), 110,
+     col = adjustcolor("grey", 0.3), border = NA)
+legend("topleft", c("visitors", "search"), col = c("steelblue", "firebrick"),
+       lwd = 2, bty = "n")
+par(op)
+
+# 월별 평균: 계절성 확인 (코로나 이전)
+pre_raw <- subset(d, ym >= PRE[1] & ym <= PRE[2])
+round(rbind(visitors_thousand = tapply(pre_raw$visitors, pre_raw$month, mean) / 1000,
+            search            = tapply(pre_raw$trend,    pre_raw$month, mean)), 0)
+
+# [관찰 포인트]
+# - 회색 구간(2020-03 ~ 2022-12)은 코로나로 입국자가 월 수백~수천 명으로 급감,
+#   검색량도 10 안팎에 머문 시기입니다. 이 구간을 그대로 넣으면 결과가 이 구간
+#   하나로 결정되므로 분석에서 제외합니다.
+# - 계절성: 검색량은 1월(평균 67)이 가장 높고, 방문은 3월(평균 277천)이 가장
+#   높습니다. 계절성을 그대로 두면 "1월 검색 → 3월 방문"이라는 매년 반복되는
+#   달력 패턴만으로도 그레인저 인과가 나올 수 있습니다(크리스마스 카드 함정).
+#   → 2절에서 계절성을 먼저 제거합니다.
+
+
+# ---- 2. 계절성 제거: 전년 동월 대비 로그 변화율 --------------------------------
+# 방법 A (본 분석): YoY = log(x_t) − log(x_{t−12})  ≈ 전년 동월 대비 증가율
+#   - 같은 달끼리 비교하므로 계절성이 사라짐
+#   - 추세도 함께 제거되어 정상 계열이 되기 쉬움
+#   - 대가: 구간마다 앞의 12개월을 잃음
+#     (코로나 이후 구간은 2023년의 전년 값이 코로나 시기이므로 2024-01부터 사용)
+# 방법 B (강건성): 로그 수준값 + 월 더미 → 7절
+make_segment <- function(range_ym) {
+  s <- subset(d, ym >= range_ym[1] & ym <= range_ym[2])
+  s$lv <- log(s$visitors); s$ls <- log(s$trend)
+  s$vis <- c(rep(NA, 12), diff(s$lv, 12))      # 방문 YoY
+  s$sch <- c(rep(NA, 12), diff(s$ls, 12))      # 검색 YoY
+  s
+}
+seg_pre  <- make_segment(PRE)
+seg_post <- make_segment(POST)
+yoy_pre  <- na.omit(seg_pre[,  c("ym", "month", "vis", "sch")])
+yoy_post <- na.omit(seg_post[, c("ym", "month", "vis", "sch")])
+c(pre = nrow(yoy_pre), post = nrow(yoy_post))   # 50, 32
+
+# 그림 2: YoY 계열
+op <- par(mfrow = c(2, 1), mar = c(3, 4, 2, 1))
+for (s in list(list(yoy_pre, "Pre-COVID (2016-01 ~ 2020-02)"),
+               list(yoy_post, "Post-COVID (2024-01 ~ 2026-08)"))) {
+  x <- s[[1]]; dt <- as.Date(sprintf("%d-%02d-01", x$ym %/% 100, x$ym %% 100))
+  plot(dt, x$vis, type = "l", lwd = 2, col = "steelblue", ylim = range(c(x$vis, x$sch)),
+       xlab = "", ylab = "YoY log change", main = s[[2]])
+  lines(dt, x$sch, lwd = 2, col = "firebrick"); abline(h = 0, lty = 3)
+  legend("bottomleft", c("visitors", "search"), col = c("steelblue", "firebrick"),
+         lwd = 2, bty = "n", cex = 0.8)
+}
+par(op)
+
+# [관찰 포인트]
+# - 코로나 이전 구간에서 검색 YoY는 2017년 초와 2019년 초·여름에 크게 튀고,
+#   방문 YoY는 2018~2019년에 20~30%대 증가를 보입니다.
+# - 검색 YoY의 변동 폭이 방문 YoY보다 훨씬 큽니다. 구글 트렌드는 표본 기반이라
+#   측정 잡음이 크다는 점을 기억해 두세요 (8절 해석에서 다시 다룸).
+
+
+# ---- 3. 정상성 점검 -----------------------------------------------------------
+stationarity <- function(x, name) {
+  data.frame(series = name,
+             ADF_p  = round(suppressWarnings(adf.test(x)$p.value), 3),
+             KPSS_p = round(suppressWarnings(kpss.test(x)$p.value), 3))
+}
+rbind(stationarity(yoy_pre$vis,  "pre  visitors YoY"),
+      stationarity(yoy_pre$sch,  "pre  search YoY"),
+      stationarity(yoy_post$vis, "post visitors YoY"),
+      stationarity(yoy_post$sch, "post search YoY"))
+
+# [해석]
+# - 코로나 이전: ADF p ≈ 0.5 (단위근 기각 못 함), KPSS p = 0.10 (정상성 기각 못 함)
+#   → 두 검정이 엇갈립니다. 관측치 50개로는 ADF의 검정력이 낮아 흔히 생기는 일입니다.
+# - 코로나 이후: ADF p = 0.02~0.04 (정상), KPSS p = 0.03~0.05 (경계선에서 비정상)
+#   → 반대 방향으로 엇갈립니다. 관측치 32개라 두 검정 모두 믿기 어렵습니다.
+# - 전년 동월 대비 변화율은 대체로 정상으로 보는 것이 일반적이지만, 판단이
+#   애매하므로 7절에서 "로그 수준값 + 월 더미 + Toda–Yamamoto"로도 확인합니다.
+#   (Toda–Yamamoto는 정상·비정상 여부와 관계없이 쓸 수 있습니다.)
+
+
+# ---- 4. 시차 선택 -------------------------------------------------------------
+sel_pre  <- select_lag(yoy_pre,  c("vis", "sch"), MAXLAG)
+sel_post <- select_lag(yoy_post, c("vis", "sch"), MAXLAG)
+sel_pre$table;  sel_pre$selection
+sel_post$table; sel_post$selection
+
+p_pre  <- as.integer(sel_pre$selection["SC"])    # 기본: SC(=BIC)
+p_post <- as.integer(sel_post$selection["SC"])
+cat("선택된 시차  pre =", p_pre, " / post =", p_post, "\n")
+
+# [해석]
+# - 두 구간 모두 세 기준(AIC, HQ, SC)이 시차 1(1개월)을 고릅니다.
+#   (코로나 이후 AIC는 시차 1과 4가 거의 같은 값)
+# - 월별 자료인데도 시차 1이 선택된 것은, 전년 동월 대비 변화율이 이미 매끄러운
+#   계열이라 직전 달 값이 대부분의 정보를 담고 있기 때문입니다.
+# - 시차 1이 "영향이 1개월 뒤에 나타난다"는 뜻은 아닙니다. 6절에서 1~6개월을
+#   모두 확인합니다.
+
+
+# ---- 5. 양방향 그레인저 검정 (본 검정, YoY) ----------------------------------
+run_pair <- function(dat, p, label) {
+  L <- build_lags(dat, c("vis", "sch"), p)
+  a <- granger_test(L, y = "vis", x = "sch", p = p)   # 검색 → 방문
+  b <- granger_test(L, y = "sch", x = "vis", p = p)   # 방문 → 검색
+  data.frame(sample = label, lag = p, n = a$n,
+             dir = c("search -> visitors", "visitors -> search"),
+             F = round(c(a$F, b$F), 2),
+             p_classic = round(c(a$p_classic, b$p_classic), 4),
+             p_HC3     = round(c(a$p_HC3,     b$p_HC3), 4))
+}
+main_tbl <- rbind(run_pair(yoy_pre,  p_pre,  "pre"),
+                  run_pair(yoy_post, p_post, "post"))
+print(main_tbl, row.names = FALSE)
+
+# [해석] (시차 1)
+# - 코로나 이전
+#     검색 → 방문 : F = 0.00, p = 0.99 (HC3 0.99)  → 전혀 유의하지 않음
+#     방문 → 검색 : F = 15.14, p = 0.0003 (HC3 0.023) → 유의
+# - 코로나 이후
+#     검색 → 방문 : p = 0.63 (HC3 0.60)
+#     방문 → 검색 : p = 0.15 (HC3 0.049) → 경계선
+# - 예상(검색 → 방문)과 반대로 "방문이 검색을 선행"하는 결과입니다.
+# - 눈여겨볼 점: 방문 → 검색에서 일반 p(0.0003)와 HC3 p(0.023)의 차이가 큽니다.
+#   8절에서 이분산은 없는 것으로 나오므로, 이 차이는 이분산이 아니라
+#   "영향력이 큰 소수의 관측치" 때문일 가능성이 큽니다. HC3는 영향력이 큰
+#   관측치의 무게를 줄여 계산하기 때문입니다. → 10절에서 확인합니다.
+
+
+# ---- 6. 시차 민감도 -----------------------------------------------------------
+sens <- do.call(rbind, lapply(1:MAXLAG, function(k) {
+  r1 <- run_pair(yoy_pre, k, "pre"); r2 <- run_pair(yoy_post, k, "post")
+  data.frame(lag = k,
+             pre_s2v  = r1$p_HC3[1], pre_v2s  = r1$p_HC3[2],
+             post_s2v = r2$p_HC3[1], post_v2s = r2$p_HC3[2])
+}))
+print(round(sens, 4))    # 모두 HC3 p값. s2v = 검색→방문, v2s = 방문→검색
+
+# [해석] (HC3 p값)
+# - 검색 → 방문: 두 구간, 모든 시차(1~6개월)에서 유의하지 않음 (p = 0.14 ~ 0.99)
+#   → 검색이 1~6개월 뒤 방문을 예측한다는 증거는 어떤 시차에서도 없습니다.
+# - 방문 → 검색: 코로나 이전 시차 1(0.023)과 3(0.025)에서 유의, 나머지는
+#   0.05 ~ 0.13으로 경계선. 코로나 이후는 시차 1(0.049)만 경계선.
+# - 방향은 일관되게 "방문 → 검색" 쪽이지만, 이 단계에서는 강도가 들쭉날쭉합니다.
+
+
+# ---- 7. 강건성 ①: 로그 수준값 + 월 더미 + Toda–Yamamoto ----------------------
+# 전년 동월 대비 변화율 대신, 로그 수준값에 월 더미(11개)로 계절성을 통제하고
+# 비정상일 수 있으므로 시차를 1개 더 넣어 검정합니다 (d_max = 1).
+ty_monthdummy <- function(seg, p, dmax = 1) {
+  s <- seg[, c("ym", "month", "lv", "ls")]
+  s$mf <- factor(s$month)
+  L <- build_lags(s, c("lv", "ls"), p + dmax, keep = "mf")
+  a <- granger_test(L, y = "lv", x = "ls", p = p + dmax, extra = "mf", test_p = p)
+  b <- granger_test(L, y = "ls", x = "lv", p = p + dmax, extra = "mf", test_p = p)
+  data.frame(p = p, dmax = dmax, n = a$n,
+             dir = c("search -> visitors", "visitors -> search"),
+             p_classic = round(c(a$p_classic, b$p_classic), 4),
+             p_HC3     = round(c(a$p_HC3,     b$p_HC3), 4))
+}
+ty_tbl <- rbind(cbind(sample = "pre",  ty_monthdummy(seg_pre,  p_pre)),
+                cbind(sample = "post", ty_monthdummy(seg_post, p_post)))
+print(ty_tbl, row.names = FALSE)
+
+# [해석]
+# - 코로나 이전: 방문 → 검색 p < 0.0001 (HC3 0.027), 검색 → 방문 p = 0.88
+# - 코로나 이후: 두 방향 모두 유의하지 않음 (0.57 ~ 0.89)
+# - 계절성을 다른 방식(월 더미)으로 처리하고 비정상성을 고려해도 코로나 이전의
+#   결론은 같습니다. 5절 결과가 변환 방식에 따른 착시는 아닙니다.
+
+
+# ---- 8. 잔차 진단 --------------------------------------------------------------
+diag_row <- function(dat, p, label) {
+  L <- build_lags(dat, c("vis", "sch"), p)
+  rbind(
+    data.frame(sample = label, eq = "visitors eq",
+               BP_p   = round(bptest(granger_test(L, "vis", "sch", p)$model)$p.value, 4),
+               BG6_p  = round(bgtest(granger_test(L, "vis", "sch", p)$model, order = 6)$p.value, 4),
+               BG12_p = round(bgtest(granger_test(L, "vis", "sch", p)$model, order = 12)$p.value, 4)),
+    data.frame(sample = label, eq = "search eq",
+               BP_p   = round(bptest(granger_test(L, "sch", "vis", p)$model)$p.value, 4),
+               BG6_p  = round(bgtest(granger_test(L, "sch", "vis", p)$model, order = 6)$p.value, 4),
+               BG12_p = round(bgtest(granger_test(L, "sch", "vis", p)$model, order = 12)$p.value, 4)))
+}
+print(rbind(diag_row(yoy_pre, p_pre, "pre"), diag_row(yoy_post, p_post, "post")),
+      row.names = FALSE)
+# BP  : 귀무가설 = 등분산             (p 작으면 이분산)
+# BG6 : 귀무가설 = 6차까지 자기상관 없음 (p 작으면 시차 부족)
+# BG12: 12차까지 — YoY 변환은 12개월 차이를 쓰므로 12차 자기상관이 남기 쉬움
+
+# [해석]
+# - BP: 네 식 모두 p > 0.5 → 이분산 문제는 없습니다. (ChickEgg와 다른 점)
+# - BG6: 대체로 문제없음. 코로나 이후는 0.05 ~ 0.09로 경계선.
+# - BG12: 검색 식에서 p ≈ 0.05 → 12개월 자기상관이 약간 남아 있습니다.
+#   전년 동월 대비 변환은 서로 11개월씩 겹치는 차이를 쓰기 때문에 생기는
+#   흔한 부작용입니다. 7절(월 더미 방식)에서 같은 결론이 나온 것이 보완이 됩니다.
+# - 이분산이 없는데도 5절에서 HC3 p가 크게 달랐으므로, 원인은 영향력이 큰
+#   관측치일 가능성이 큽니다. → 10절
+
+
+# ---- 9. 강건성 ②: wild bootstrap p값 ------------------------------------------
+# 분포 가정 없이, 이분산을 허용하는 방식으로 p값을 다시 구합니다.
+# B = 9999회. PC에 따라 수십 초 걸릴 수 있습니다.
+B <- 9999
+boot_tbl <- do.call(rbind, lapply(list(list(yoy_pre, p_pre, "pre"),
+                                       list(yoy_post, p_post, "post")), function(s) {
+  L <- build_lags(s[[1]], c("vis", "sch"), s[[2]])
+  data.frame(sample = s[[3]], lag = s[[2]],
+             dir = c("search -> visitors", "visitors -> search"),
+             p_wildboot = c(wild_boot(L, "vis", "sch", s[[2]], B = B),
+                            wild_boot(L, "sch", "vis", s[[2]], B = B)))
+}))
+print(boot_tbl, row.names = FALSE)
+
+# [해석]
+# - 코로나 이전: 방문 → 검색 p = 0.080, 검색 → 방문 p = 0.99
+# - 코로나 이후: 방문 → 검색 p = 0.092, 검색 → 방문 p = 0.57
+# - 부트스트랩 p도 일반 p(0.0003)보다 훨씬 큽니다. 5·8절과 합쳐 보면, 소수의
+#   관측치가 결과를 크게 좌우하고 있다는 신호입니다. → 10절
+
+
+# ---- 10. 기저효과 점검: 전년 동월 대비 변환의 함정 --------------------------
+# YoY는 "작년 같은 달"과 비교하므로, 작년 같은 달이 비정상적이었다면 올해 값이
+# 실제 변화와 무관하게 크게 튑니다(기저효과). 이 자료에는 두 번 있습니다.
+#   ① 메르스(MERS, 2015년 6~8월): 2015-07 입국자 8.2만 명(평소의 절반 이하)
+#      → 2016-06 ~ 2016-08의 방문 YoY가 +42 ~ +82%로 튐
+#   ② 코로나 회복기(2023년 상반기): 2023-01 입국자 6.7만 명(회복 중)
+#      → 2024-01 ~ 2024-06의 방문 YoY가 +27 ~ +76%로 튀는데,
+#        검색 YoY는 같은 기간 0 ~ −34%로 반대 방향
+print(subset(d, ym >= 201505 & ym <= 201509, c(ym, visitors, trend)))
+print(round(subset(yoy_pre,  ym >= 201605 & ym <= 201609), 3))
+print(round(subset(yoy_post, ym <= 202408), 3))
+
+# 기저효과 관측치 식별: 시차 1이면 2016-09도 2016-08을 시차값으로 씀
+MERS_BASE     <- 201606:201609
+RECOVERY_BASE <- 202401:202406
+
+# 영향력이 큰 관측치 확인 (코로나 이전, 방문 → 검색 식)
+Lchk <- build_lags(yoy_pre, c("vis", "sch"), p_pre, keep = "ym")
+mchk <- lm(reformulate(c(paste0("sch_L", 1:p_pre), paste0("vis_L", 1:p_pre)), "sch"),
+           data = Lchk)
+infl <- data.frame(ym = Lchk$ym, hat = round(hatvalues(mchk), 3),
+                   cook = round(cooks.distance(mchk), 3))
+head(infl[order(-infl$cook), ], 5)
+
+# 기저효과 관측치를 뺀 재검정
+clean_test <- function(dat, p, exclude, label) {
+  L <- build_lags(dat, c("vis", "sch"), p, keep = "ym")
+  L <- L[!(L$ym %in% exclude), ]
+  a <- granger_test(L, "vis", "sch", p); b <- granger_test(L, "sch", "vis", p)
+  data.frame(sample = label, lag = p, n = a$n,
+             dir = c("search -> visitors", "visitors -> search"),
+             p_classic  = round(c(a$p_classic, b$p_classic), 4),
+             p_HC3      = round(c(a$p_HC3, b$p_HC3), 4),
+             p_wildboot = round(c(wild_boot(L, "vis", "sch", p, B = B),
+                                  wild_boot(L, "sch", "vis", p, B = B)), 4))
+}
+clean_tbl <- rbind(
+  clean_test(yoy_pre, p_pre, MERS_BASE, "pre, excl. MERS base"),
+  do.call(rbind, lapply(2:3, function(k) clean_test(yoy_pre, k, MERS_BASE,
+                                                    paste0("pre, excl. MERS base (lag ", k, ")")))),
+  clean_test(yoy_post, p_post, RECOVERY_BASE, "post, excl. recovery base"))
+print(clean_tbl, row.names = FALSE)
+
+# [해석]
+# - 영향력 확인: Cook's 거리가 가장 큰 관측치는 2016-08 (0.62)입니다. 이 달의
+#   설명변수인 2016-07 방문 YoY가 +82%(메르스 기저효과)로 극단값이기 때문입니다.
+#   다음은 2018-05 (0.41), 2019-09 (0.20) 순.
+# - 메르스 기저효과 4개월을 빼면 (코로나 이전)
+#     방문 → 검색 : 시차 1 HC3 p = 0.0014, wild bootstrap p = 0.027
+#                   시차 2 HC3 p = 0.0036, bootstrap p = 0.028
+#                   시차 3 HC3 p = 0.018,  bootstrap p = 0.036
+#     검색 → 방문 : 모든 시차에서 유의하지 않음 (HC3 0.14 ~ 0.64)
+#   → 극단값을 빼자 "방문 → 검색"은 오히려 더 강하고 안정적으로 나타납니다.
+#     5절의 일반 p와 HC3 p의 차이는, 방향이 반대인 극단값 하나가 결과를
+#     흔들었기 때문이었습니다.
+# - 코로나 이후 (회복기 기저효과 6개월 제외, n = 26): 두 방향 모두 유의하지 않음.
+#   관측치가 너무 적어 결론을 내릴 수 없습니다.
+# - 교훈: 전년 동월 대비 변화율은 계절성을 없애 주지만, "작년 같은 달"에 충격이
+#   있었다면 1년 뒤에 가짜 급등락을 만듭니다. 변환 후 그래프를 꼭 확인하세요.
+
+
+# ---- 11. 두 구간 합치기: 관측치를 늘려 검정력 높이기 ---------------------------
+# 구간마다 따로 시차를 만든 뒤 합칩니다. 이렇게 하면 시차가 코로나 공백을
+# 건너뛰지 않습니다. 구간 더미(post)로 두 구간의 평균 수준 차이를 통제하고,
+# 10절의 기저효과 관측치는 뺍니다.
+p_pool <- max(p_pre, p_post)
+Lp <- rbind(cbind(build_lags(yoy_pre,  c("vis", "sch"), p_pool, keep = "ym"), post = 0),
+            cbind(build_lags(yoy_post, c("vis", "sch"), p_pool, keep = "ym"), post = 1))
+Lp <- Lp[!(Lp$ym %in% c(MERS_BASE, RECOVERY_BASE)), ]
+pool_a <- granger_test(Lp, "vis", "sch", p_pool, extra = "post")
+pool_b <- granger_test(Lp, "sch", "vis", p_pool, extra = "post")
+data.frame(lag = p_pool, n = pool_a$n,
+           dir = c("search -> visitors", "visitors -> search"),
+           p_classic = round(c(pool_a$p_classic, pool_b$p_classic), 4),
+           p_HC3     = round(c(pool_a$p_HC3,     pool_b$p_HC3), 4))
+
+# [해석] (시차 1, 기저효과 제외, n = 71)
+# - 방문 → 검색 : p = 0.0001 (HC3 0.0017)
+# - 검색 → 방문 : p = 0.23 (HC3 0.44)
+# - 두 구간을 합쳐 관측치를 늘려도 결론은 같습니다. 다만 합친 결과는 대부분
+#   관측치가 많은 코로나 이전 구간이 이끌고 있다는 점을 감안해야 합니다.
+
+
+# ---- 12. 이동창: 코로나 이전 구간에서 관계가 안정적인가 ----------------------
+W <- 36    # 창 길이(개월)
+starts <- 1:(nrow(yoy_pre) - W + 1)
+roll <- do.call(rbind, lapply(starts, function(i) {
+  win <- yoy_pre[i:(i + W - 1), ]
+  r <- run_pair(win, p_pre, "win")
+  data.frame(start = win$ym[1], end = win$ym[W],
+             s2v = r$p_HC3[1], v2s = r$p_HC3[2])
+}))
+plot(seq_along(roll$end), roll$v2s, type = "b", pch = 19, col = "steelblue",
+     log = "y", ylim = range(c(roll$s2v, roll$v2s, 0.001)), xaxt = "n",
+     xlab = "window end", ylab = "p-value (HC3, log scale)",
+     main = paste0("Rolling ", W, "-month Granger tests (pre-COVID)"))
+lines(seq_along(roll$end), roll$s2v, type = "b", pch = 17, col = "firebrick")
+axis(1, at = seq_along(roll$end), labels = roll$end, las = 2, cex.axis = 0.6)
+abline(h = 0.05, lty = 2)
+legend("bottomright", c("visitors -> search", "search -> visitors"),
+       col = c("steelblue", "firebrick"), pch = c(19, 17), bty = "n")
+print(transform(roll, s2v = round(s2v, 3), v2s = round(v2s, 3)))
+
+# [해석] (창 36개월, HC3 p)
+# - 검색 → 방문: 모든 창에서 p > 0.48. 어느 시기에도 신호가 없습니다.
+# - 방문 → 검색: 메르스 기저효과가 들어 있는 초기 창(2016-01 ~ 2016-06 시작)은
+#   p = 0.04 안팎, 2016-07 ~ 2019-06 창은 0.12, 2019년 7월 이후로 끝나는 창은
+#   p = 0.000 ~ 0.005.
+# - ChickEgg와 달리 특정 시기에만 나타나는 관계가 아니라, 코로나 이전 기간
+#   전반에 걸쳐 유지되는 관계로 보입니다.
+
+
+# ---- 13. 동시점과 교차상관: 그레인저 검정이 보지 못하는 것 --------------------
+# 그레인저 검정은 "과거"만 봅니다. 같은 달 안에서 일어나는 관계는 잡지 못합니다.
+# 교차상관(CCF)으로 시차별 상관을 함께 봅니다.
+#   lag −1 : 이번 달 방문 vs 지난달 검색   (검색이 선행)
+#   lag  0 : 같은 달
+#   lag +1 : 이번 달 방문 vs 다음 달 검색  (방문이 선행)
+ccf_tab <- function(x) {
+  r <- ccf(x$sch, x$vis, lag.max = 3, plot = FALSE)   # cor(sch[t+k], vis[t])
+  setNames(round(as.numeric(r$acf), 2), r$lag)
+}
+rbind(pre            = ccf_tab(yoy_pre),
+      pre_exclMERS   = ccf_tab(yoy_pre[!(yoy_pre$ym %in% MERS_BASE), ]),
+      post_from2407  = ccf_tab(subset(yoy_post, ym >= 202407)))
+
+# [해석]
+# - 코로나 이전: 상관이 가장 큰 곳은 lag +1 (0.68, 메르스 제외 시 0.70)
+#   → "이번 달 방문"은 "다음 달 검색"과 가장 강하게 함께 움직입니다.
+#   같은 달(lag 0)도 0.62로 높고, "지난달 검색"(lag −1)은 0.41입니다.
+# - 같은 달 상관이 높다는 것은, 검색 → 방문 효과가 있더라도 한 달 안에 끝나서
+#   월별 그레인저 검정으로는 잡히지 않을 가능성을 시사합니다.
+# - 코로나 이후(2024-07 이후): 모든 시차에서 0.25 이하. 관계가 약해졌습니다.
+
+
+# ---- 14. 결과 요약과 해석 ------------------------------------------------------
+# [결과 요약]
+# | 구간                  | 검색 → 방문      | 방문 → 검색                      |
+# |-----------------------|------------------|----------------------------------|
+# | 코로나 이전 (본 검정) | 비유의 (p ≈ 0.99)| 유의 (HC3 0.023)                 |
+# | 메르스 기저효과 제외  | 비유의           | 강하게 유의 (HC3 0.001, boot 0.03)|
+# | 월 더미 + TY          | 비유의           | 유의 (HC3 0.027)                 |
+# | 두 구간 통합          | 비유의           | 유의 (HC3 0.002)                 |
+# | 코로나 이후           | 비유의           | 결론 불가 (n 부족, 기저효과)     |
+#
+# [결론]
+# - 코로나 이전(2015~2020년 2월) 일본에서는, 방한 일본인 관광객 수의 변화가
+#   "韓国旅行" 검색량의 변화를 약 1개월 선행했습니다(방문 → 검색 단방향).
+#   이 결론은 계절성 처리 방식, 시차, 이분산 강건 검정, 부트스트랩, 극단값 제외,
+#   이동창에 걸쳐 유지됩니다.
+# - 검색 → 방문은 월별 자료로 확인되지 않았습니다.
+# - 코로나 이후는 관측치가 적고 회복기 기저효과가 커서 결론을 내릴 수 없습니다.
+#
+# [왜 예상과 반대일까: 검토할 가설]
+#   1) 여행 준비 기간이 짧다: 일본→한국은 비행 2~3시간이라 검색에서 방문까지가
+#      한 달 안에 끝날 수 있습니다. 그러면 검색 → 방문은 "같은 달"에 묻혀 월별
+#      그레인저 검정으로는 보이지 않습니다(13절의 높은 동시점 상관).
+#      → 주별 검색량 자료로 확인해 볼 수 있습니다.
+#   2) 방문이 관심을 부른다: 방한객이 늘면 SNS 후기, 언론 보도, 주변의 경험담이
+#      늘고, 이것이 다음 달 검색을 끌어올립니다. Bass 모형의 입소문(q)과 같은
+#      경로입니다.
+#   3) 검색어의 성격: "韓国旅行"은 막연한 관심 단계의 검색어일 수 있습니다.
+#      실제 예약 직전에는 "ソウル ホテル", "韓国 航空券"처럼 구체적인 검색어를
+#      씁니다. → 검색어를 바꿔 같은 분석을 반복해 볼 가치가 있습니다.
+#   4) 측정 잡음의 비대칭: 구글 트렌드는 표본 기반이라 잡음이 큽니다. 잡음이 큰
+#      변수가 "설명변수"로 들어가면 효과가 0 쪽으로 줄어들지만(검색 → 방문),
+#      "종속변수"로 들어가면 편의는 생기지 않습니다(방문 → 검색). 그래서 이 자료는
+#      구조적으로 "방문 → 검색"이 더 잘 잡히는 쪽으로 기울어 있을 수 있습니다.
+#   5) 코로나 이후의 변화: 방문은 역대 최고인데 검색 수준은 코로나 이전보다 낮습니다.
+#      여행 정보를 찾는 경로가 구글 검색에서 SNS(인스타그램, 틱톡 등)로 옮겨 갔을
+#      가능성이 있습니다. 확인이 필요한 가설입니다.
+#
+# [보고 문장 예시]
+#   계절성을 제거하기 위해 전년 동월 대비 로그 변화율을 사용하고, 코로나 기간
+#   (2020년 3월 ~ 2022년 12월)을 제외해 전·후 구간을 나눠 분석했다. 코로나 이전
+#   구간에서 방한 일본인 관광객 수는 일본 내 "韓国旅行" 검색량을 그레인저 인과했으나
+#   (시차 1, 이분산 강건 F검정 p = 0.023; 메르스 기저효과 제외 시 p = 0.001),
+#   검색량이 관광객 수를 그레인저 인과한다는 증거는 1~6개월의 어떤 시차에서도
+#   확인되지 않았다. 이 결과는 월 더미를 이용한 Toda–Yamamoto 검정, wild bootstrap,
+#   이동창 분석에서도 유지되었다. 코로나 이후 구간은 관측치가 적고 회복기
+#   기저효과가 커서 결론을 유보한다. 검색 → 방문 효과가 한 달 안에 끝날 가능성이
+#   있으므로, 주별 자료와 구체적인 검색어를 이용한 추가 분석이 필요하다.
